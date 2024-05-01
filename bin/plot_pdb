@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+import argparse
+
+
+from amphiquantic.file.pdb import plot_molecule
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
+    parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    plot_molecule(args.pdb_file)
