@@ -2,16 +2,27 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use serde::{Deserialize, Serialize};
-
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::utils::get_bond_distances_path;
 
 #[derive(Serialize, Deserialize, Debug)]
-struct BondDistances {
+pub struct BondDistances {
     bond_distances: HashMap<String, (f64, f64)>,
 }
 
-fn load_bond_data() -> HashMap<String, (f64, f64)> {
+impl ToPyObject for BondDistances {
+    fn to_object(&self, py: Python) -> PyObject {
+        let dict = PyDict::new(py);
+        for (key, value) in self.bond_distances.iter() {
+            dict.set_item(key, value).unwrap();
+        }
+        dict.into()
+    }
+}
+
+pub(crate) fn load_bond_data() -> HashMap<String, (f64, f64)> {
     let path = get_bond_distances_path();
     println!("Loading bond data from: {}", path);
     let mut file = File::open(path).unwrap();

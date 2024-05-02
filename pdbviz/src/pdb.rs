@@ -7,8 +7,10 @@ pub(crate) fn parse_pdb_file(file_path: &str) -> (Vec<(f64, f64, f64)>, Vec<Stri
     let reader = BufReader::new(file);
     let mut coords = Vec::new();
     let mut atom_types = Vec::new();
+    // let mut bonds = Vec::new();
     for line in reader.lines() {
         let line = line.unwrap();
+        // Handle both ATOM and HETATM records
         if line.starts_with("ATOM") || line.starts_with("HETATM") {
             let atom_type = line[76..78].trim().to_string();
             let x = line[30..38].trim().parse::<f64>().unwrap();
@@ -17,9 +19,23 @@ pub(crate) fn parse_pdb_file(file_path: &str) -> (Vec<(f64, f64, f64)>, Vec<Stri
             coords.push((x, y, z));
             atom_types.push(atom_type);
         }
+        // // Handle CONECT records for bonds
+        // if line.starts_with("CONECT") {
+        //     let mut split = line.split_whitespace();
+        //     split.next();
+        //     let from = split.next().unwrap().parse::<usize>().unwrap() - 1;
+        //     let mut to = Vec::new();
+        //     while let Some(t) = split.next() {
+        //         to.push(t.parse::<usize>().unwrap() - 1);
+        //     }
+        //     for t in to {
+        //         bonds.push((from, t));
+        //     }
+        // }
     }
     (coords, atom_types)
 }
+
 
 pub(crate) fn adjust_coordinates(
     raw_coords: Vec<(f64, f64, f64)>,

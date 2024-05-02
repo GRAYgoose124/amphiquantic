@@ -2,8 +2,9 @@ import matplotlib.pyplot as plt
 
 
 # from amphiquantic.molecule.bonds import determine_bonds
-from pdbviz import determine_bonds, parse_pdb_file
-from amphiquantic.utils.data import ATOM_COLORS, ATOM_RADII
+from pdbviz import determine_bonds, parse_pdb_file, utilities as ut
+
+ATOM_PROPERTIES = ut.load_atom_properties()
 
 
 def plot_molecule(filename):
@@ -24,8 +25,11 @@ def plot_molecule(filename):
     default_rescale = 500
 
     for i, (x, y, z) in enumerate(coords):
-        color = ATOM_COLORS.get(atom_types[i], default_color)
-        size = ATOM_RADII.get(atom_types[i], default_scale) * default_rescale
+        color = ATOM_PROPERTIES.get(atom_types[i]).get("color", default_color)
+        size = (
+            ATOM_PROPERTIES.get(atom_types[i]).get("radius", default_scale)
+            * default_rescale
+        )
         ax.scatter(
             x, y, z, color=color, s=size, label=atom_types[i], edgecolors="black"
         )
@@ -52,7 +56,7 @@ def plot_molecule_with_py3dmol(filename):
 
     view = py3Dmol.view(width=800, height=400)
     for i, (x, y, z) in enumerate(coords):
-        color = ATOM_COLORS.get(atom_types[i], (0.5, 0.0, 0.5))
+        color = ATOM_PROPERTIES.get(atom_types[i]).get("color", (0.5, 0.0, 0.5))
         color_hex = "#{:02x}{:02x}{:02x}".format(
             int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
         )
@@ -60,7 +64,7 @@ def plot_molecule_with_py3dmol(filename):
             {
                 "center": {"x": x, "y": y, "z": z},
                 "color": color_hex,
-                "radius": ATOM_RADII[atom_types[i]],
+                "radius": ATOM_PROPERTIES.get(atom_types[i]).get("radius", 0.5),
             }
         )
 
