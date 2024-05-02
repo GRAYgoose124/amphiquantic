@@ -79,10 +79,14 @@ fn rustquantic(_py: Python, m: &PyModule) -> PyResult<()> {
     fn parse_pdb_file_py(
         _py: Python,
         file_path: &str,
-    ) -> (Vec<(f64, f64, f64)>, Vec<String>) {
-        parse_pdb_file(file_path)
-    }
+    ) -> ((Py<PyArray2<f64>>, Vec<String>), Vec<(usize, usize)>) {
+        let ((coords, atom_types), bonds) = parse_pdb_file(file_path);
+        let coords_array = Array2::from_shape_vec((coords.len(), 3), coords.into_iter().flat_map(|(x, y, z)| vec![x, y, z]).collect()).unwrap();
+        let coords_numpy = coords_array.into_pyarray(_py).to_owned();
 
+        ((coords_numpy, atom_types), bonds)
+    }
+    
     #[pyfn(m, name = "adjust_coordinates")]
     fn adjust_coordinates_py(
         py: Python,

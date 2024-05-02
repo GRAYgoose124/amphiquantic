@@ -8,9 +8,14 @@ from amphiquantic.molecule.plot import plot_molecule
 def parse_args():
     parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
     parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
+    parser.add_argument(
+        "--no-explicit-bonds",
+        action="store_false",
+        help="Plot explicit bonds between atoms",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    plot_molecule(args.pdb_file)
+    plot_molecule(args.pdb_file, explicit_bonds=args.no_explicit_bonds)

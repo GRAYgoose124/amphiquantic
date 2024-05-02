@@ -2,12 +2,12 @@ use std::fs::File;
 use std::io::{BufReader, BufRead};
 
 
-pub(crate) fn parse_pdb_file(file_path: &str) -> (Vec<(f64, f64, f64)>, Vec<String>) {
+pub(crate) fn parse_pdb_file(file_path: &str) -> ((Vec<(f64, f64, f64)>, Vec<String>), Vec<(usize, usize)>) {
     let file = File::open(file_path).unwrap();
     let reader = BufReader::new(file);
     let mut coords = Vec::new();
     let mut atom_types = Vec::new();
-    // let mut bonds = Vec::new();
+    let mut bonds = Vec::new();
     for line in reader.lines() {
         let line = line.unwrap();
         // Handle both ATOM and HETATM records
@@ -19,21 +19,21 @@ pub(crate) fn parse_pdb_file(file_path: &str) -> (Vec<(f64, f64, f64)>, Vec<Stri
             coords.push((x, y, z));
             atom_types.push(atom_type);
         }
-        // // Handle CONECT records for bonds
-        // if line.starts_with("CONECT") {
-        //     let mut split = line.split_whitespace();
-        //     split.next();
-        //     let from = split.next().unwrap().parse::<usize>().unwrap() - 1;
-        //     let mut to = Vec::new();
-        //     while let Some(t) = split.next() {
-        //         to.push(t.parse::<usize>().unwrap() - 1);
-        //     }
-        //     for t in to {
-        //         bonds.push((from, t));
-        //     }
-        // }
+        // Handle CONECT records for bonds
+        if line.starts_with("CONECT") {
+            let mut split = line.split_whitespace();
+            split.next();
+            let from = split.next().unwrap().parse::<usize>().unwrap() - 1;
+            let mut to = Vec::new();
+            while let Some(t) = split.next() {
+                to.push(t.parse::<usize>().unwrap() - 1);
+            }
+            for t in to {
+                bonds.push((from, t));
+            }
+        }
     }
-    (coords, atom_types)
+    ((coords, atom_types), bonds)
 }
 
 

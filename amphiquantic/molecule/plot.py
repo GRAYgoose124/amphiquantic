@@ -7,11 +7,12 @@ from rustquantic import determine_bonds, parse_pdb_file, utilities as ut
 ATOM_PROPERTIES = ut.load_atom_properties()
 
 
-def plot_molecule(filename):
-    coords, atom_types = parse_pdb_file(filename)
-
-    # timeit
-    bonds, near, missing = determine_bonds(coords, atom_types)
+def plot_molecule(filename, explicit_bonds=True):
+    # coords, atom_types = parse_pdb_file(filename)
+    ((coords, atom_types), bonds) = parse_pdb_file(filename)
+    if not explicit_bonds:
+        print("Ignoring explicit bonds and determining bonds automatically.")
+        bonds, near, missing = determine_bonds(coords, atom_types)
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -50,9 +51,9 @@ def plot_molecule(filename):
 def plot_molecule_with_py3dmol(filename):
     import py3Dmol
 
-    coords, atom_types = parse_pdb_file(filename)
+    (coords, atom_types), bonds = parse_pdb_file(filename)
 
-    bonds, _, _ = determine_bonds(coords, atom_types)
+    # bonds, _, _ = determine_bonds(coords, atom_types)
 
     view = py3Dmol.view(width=800, height=400)
     for i, (x, y, z) in enumerate(coords):
