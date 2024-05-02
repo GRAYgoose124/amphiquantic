@@ -2,7 +2,7 @@
 import argparse
 
 
-from amphiquantic.file.pdb import plot_molecule
+from amphiquantic.molecule.plot import plot_molecule
 
 
 def parse_args():

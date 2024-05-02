@@ -1,2 +1,4 @@
 *.egg-info
 *.pyc
+*git-ignored*
+*.lock

@@ -1,0 +1,5 @@
+C: {color: [0.5, 0.5, 0.5], radius: 0.7, valence: 4}
+H: {color: [1, 1, 1], radius: 0.4, valence: 1}
+O: {color: [1, 0, 0], radius: 0.6, valence: 2}
+N: {color: [0, 0, 1], radius: 0.65, valence: 3}
+S: {color: [1, 1, 0], radius: 0.75, valence: 6}
