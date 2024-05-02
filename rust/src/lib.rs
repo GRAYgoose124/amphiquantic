@@ -53,11 +53,15 @@ fn utilities(_py: Python, m: &PyModule) -> PyResult<()> {
         dict.into()
     }
 
+    m.add_wrapped(wrap_pyfunction!(get_data_path_py))?;
+    m.add_wrapped(wrap_pyfunction!(get_bond_distances_path_py))?;
+    m.add_wrapped(wrap_pyfunction!(get_atom_properties_path_py))?;
+
     Ok(())
 }
 
 #[pymodule]
-fn pdbviz(_py: Python, m: &PyModule) -> PyResult<()> {
+fn rustquantic(_py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m, name = "determine_bonds")]
     fn determine_bonds_py(
         py: Python,

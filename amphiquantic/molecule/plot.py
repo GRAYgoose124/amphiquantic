@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 
 
 # from amphiquantic.molecule.bonds import determine_bonds
-from pdbviz import determine_bonds, parse_pdb_file, utilities as ut
+from rustquantic import determine_bonds, parse_pdb_file, utilities as ut
 
 ATOM_PROPERTIES = ut.load_atom_properties()
 

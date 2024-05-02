@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-cd pdbviz/
+cd rust/
 maturin develop
 cd ..

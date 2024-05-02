@@ -2,16 +2,15 @@
 
 # set data path
 if [ -z "$PDBVIZ_DATA_PATH" ]; then
-    . ./pdbviz/set_data_path.sh
-    echo "PDBVIZ_DATA_PATH set to $PDBVIZ_DATA_PATH"
+    . ./rust/set_data_path.sh
 fi
 
 # 0 build 
-./0_build_pdbviz.sh
+./scripts/0_build_pdbviz.sh
 
 # 1 run
-if [ -f "1_ct-git-ignored.sh" ]; then
-    ./1_ct-git-ignored.sh
+if [ -f "scripts/1_ct-git-ignored.sh" ]; then
+    ./scripts/1_ct-git-ignored.sh
 else
-    ./1_demo_script.sh
+    ./scripts/1_demo_script.sh
 fi
