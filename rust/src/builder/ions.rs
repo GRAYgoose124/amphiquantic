@@ -1,4 +1,8 @@
 use rand::Rng;
+use std::collections::HashMap;
+
+use crate::bonds::AVG_BOND_DISTANCES;
+use crate::bonds::BOND_DISTANCES;
 
 /// Add ions to a structure to neutralize the system or achieve a specific concentration.
 pub fn add_ions(
@@ -22,4 +26,45 @@ pub fn add_ions(
         coords.push((x, y, z));
         atom_types.push(ion.to_string());
     }
+}
+
+
+// Find realistic locations for ions in a structure.
+
+pub fn find_possible_ion_locations(
+    coords: &Vec<(f64, f64, f64)>,
+    atom_types: &mut Vec<String>,
+) -> Vec<(f64, f64, f64)> {
+   // don't randomly place, use bond data to find possible locations
+    let bond_distances = BOND_DISTANCES.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<String, (f64, f64)>>();
+    let avg_bond_distances = AVG_BOND_DISTANCES.iter().map(|(k, v)| (k.clone(), *v)).collect::<HashMap<String, f64>>();
+
+    let threshold = 0.2;
+    let mut possible_locations = vec![];
+    let num_atoms = coords.len();
+
+    for i in 0..num_atoms {
+        for j in 0..num_atoms {
+            if i == j {
+                continue;
+            }
+            let pair = format!("{}-{}", atom_types[i], atom_types[j]);
+            let typical_dist_key = avg_bond_distances.get(&pair).or_else(|| avg_bond_distances.get(&format!("{}-{}", atom_types[j], atom_types[i])));
+            if let Some(&typ) = typical_dist_key {
+                let dist = ((coords[i].0 - coords[j].0).powi(2) +
+                            (coords[i].1 - coords[j].1).powi(2) +
+                            (coords[i].2 - coords[j].2).powi(2)).sqrt();
+                if (dist - typ).abs() <= threshold {
+                    let new_coord = (
+                        (coords[i].0 + coords[j].0) / 2.0,
+                        (coords[i].1 + coords[j].1) / 2.0,
+                        (coords[i].2 + coords[j].2) / 2.0,
+                    );
+                    possible_locations.push(new_coord);
+                }
+            }
+        }
+    }
+
+    possible_locations
 }

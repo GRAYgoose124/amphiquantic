@@ -1,7 +1,7 @@
 use rand::Rng;
 
 /// Add a box of water (or other solvent) around a molecular system.
-pub fn solvate_box(
+pub(crate) fn solvate_box(
     coords: &mut Vec<(f64, f64, f64)>,
     atom_types: &mut Vec<String>,
     box_size: f64,

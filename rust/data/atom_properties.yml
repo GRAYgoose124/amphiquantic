@@ -3,3 +3,5 @@ H: {color: [1, 1, 1], radius: 0.4, valence: 1}
 O: {color: [1, 0, 0], radius: 0.6, valence: 2}
 N: {color: [0, 0, 1], radius: 0.65, valence: 3}
 S: {color: [1, 1, 0], radius: 0.75, valence: 6}
+Na: {color: [0.67, 0.36, 0.95], radius: 1.02, valence: 1}
+Ca: {color: [0.24, 0.94, 0.24], radius: 0.99, valence: 2}

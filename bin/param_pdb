@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+import argparse
+
+from amphiquantic.molecule.plot import plot_molecule
+
+from rustquantic import utilities as ut, builder as bd
+from rustquantic import PdbFilePy
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
+    parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
+    parser.add_argument(
+        "--no-explicit-bonds",
+        action="store_false",
+        help="Plot explicit bonds between atoms",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    pdb_file = PdbFilePy.parse(args.pdb_file)
+    coords, atom_types = pdb_file.coords, pdb_file.atom_types
+    bonds, _, _ = pdb_file.determine_bonds()

@@ -1,19 +1,30 @@
+import logging
 import matplotlib.pyplot as plt
 
 
 # from amphiquantic.molecule.bonds import determine_bonds
 from rustquantic import PdbFilePy, utilities as ut
 
+logger = logging.getLogger(__name__)
+
 ATOM_PROPERTIES = ut.load_atom_properties()
 
 
 def plot_molecule(filename, explicit_bonds=True):
-    # coords, atom_types = parse_pdb_file(filename)
     pdb_file = PdbFilePy.parse(filename)
     coords, atom_types = pdb_file.coords, pdb_file.atom_types
+    print(len(atom_types))
     if not explicit_bonds:
         print("Ignoring explicit bonds and determining bonds automatically.")
         bonds, _, _ = pdb_file.determine_bonds()
+    else:
+        bonds = pdb_file.bonds
+
+    plot_atoms(coords, atom_types, bonds)
+
+
+def plot_atoms(coords, atom_types, bonds):
+    # coords, atom_types = parse_pdb_file(filename)
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -26,8 +37,15 @@ def plot_molecule(filename, explicit_bonds=True):
     default_scale = 0.5
     default_rescale = 500
 
+    print(ATOM_PROPERTIES)
     for i, (x, y, z) in enumerate(coords):
-        color = ATOM_PROPERTIES.get(atom_types[i]).get("color", default_color)
+        try:
+            color = ATOM_PROPERTIES.get(atom_types[i]).get("color", default_color)
+        except AttributeError:
+            color = default_color
+            logger.warning(f"Color not found for atom type {atom_types[i]}")
+            print(f"Color not found for atom type {atom_types[i]}: {i} {len(coords)}")
+
         size = (
             ATOM_PROPERTIES.get(atom_types[i]).get("radius", default_scale)
             * default_rescale

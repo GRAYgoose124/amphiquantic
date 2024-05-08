@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use std::fs::File;
-use std::io::{BufReader, BufRead};
+use std::io::{BufReader, BufRead, BufWriter, Write};
 use std::collections::HashSet;
 
 
@@ -100,6 +100,20 @@ pub fn adjust_coordinates_tuple(
     adjusted_coords
 }
 
+// write pdb - with optional bonds
+pub fn write_pdb(file_path: &str, coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, bonds: Option<Vec<(usize, usize)>>) {
+    let file = File::create(file_path).unwrap();
+    let mut writer = BufWriter::new(file);
+    for (i, (x, y, z)) in coords.iter().enumerate() {
+        let atom_type = atom_types[i].clone();
+        writeln!(writer, "ATOM  {:>5} {:<3} MOL     1    {:>8.3} {:>8.3} {:>8.3}  1.00  0.00          {:>2}", i + 1, atom_type, x, y, z, atom_type).unwrap();
+    }
+    if let Some(bonds) = bonds {
+        for (from, to) in bonds {
+            writeln!(writer, "CONECT {:>5} {:>5}", from + 1, to + 1).unwrap();
+        }
+    }
+}
 
 #[pymethods]
 impl PdbFilePy {
@@ -129,5 +143,9 @@ impl PdbFilePy {
 
     pub fn set_bonds(&mut self, bonds: Vec<(usize, usize)>) {
         self.bonds = bonds;
+    }
+
+    pub fn write(&self, file_path: &str, write_bonds: bool) {
+        write_pdb(file_path, self.coords.clone(), self.atom_types.clone(), if write_bonds { Some(self.bonds.clone()) } else { None });
     }
 }

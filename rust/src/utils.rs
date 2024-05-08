@@ -2,7 +2,7 @@ use std::env;
 
 pub(crate) fn get_data_path() -> String {
     // append bond_distances.yml to the data path
-     env::var("PDBVIZ_DATA_PATH").unwrap_or_else(|_| "data".to_string())
+     env::var("PDBVIZ_DATA_PATH").unwrap_or_else(|_| "rust/data".to_string())
 }
 
 pub(crate) fn get_bond_distances_path() -> String {

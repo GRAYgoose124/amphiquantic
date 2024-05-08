@@ -33,8 +33,8 @@ pub(crate) fn load_bond_data() -> HashMap<String, (f64, f64)> {
 }
 
 lazy_static::lazy_static! {
-    static ref BOND_DISTANCES: HashMap<String, (f64, f64)> = load_bond_data();
-    static ref AVG_BOND_DISTANCES: HashMap<String, f64> = {
+    pub(crate) static ref BOND_DISTANCES: HashMap<String, (f64, f64)> = load_bond_data();
+    pub(crate) static ref AVG_BOND_DISTANCES: HashMap<String, f64> = {
         let mut avg_bond_distances = HashMap::new();
         for (k, (min, max)) in BOND_DISTANCES.iter() {
             avg_bond_distances.insert(k.clone(), (min + max) / 2.0);

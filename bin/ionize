@@ -1,0 +1,44 @@
+#!/usr/bin/env python
+import argparse
+
+from amphiquantic.molecule.plot import plot_molecule
+
+from rustquantic import utilities as ut, builder as bd
+from rustquantic import PdbFilePy
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
+    parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
+    parser.add_argument(
+        "--no-explicit-bonds",
+        action="store_false",
+        help="Plot explicit bonds between atoms",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    pdb_file = PdbFilePy.parse(args.pdb_file)
+    coords, atom_types = pdb_file.coords, pdb_file.atom_types
+    if args.no_explicit_bonds:
+        bonds, _, _ = pdb_file.determine_bonds()
+    else:
+        bonds = pdb_file.bonds
+
+    # ions
+    ion_coords = bd.find_possible_ion_locations(coords, atom_types)
+    print("Found %d possible ion locations" % len(ion_coords))
+    for ion_coord in ion_coords:
+        coords.append(ion_coord)
+        atom_types.append("Na")
+
+    assert len(coords) == len(atom_types)
+
+    # create new pdb file
+    new_pdb_file = PdbFilePy(coords, atom_types, bonds)
+    new_pdb_file.write("new.pdb", False)
+
+    # plot
+    plot_molecule("new.pdb", explicit_bonds=args.no_explicit_bonds)
