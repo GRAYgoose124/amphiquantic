@@ -25,6 +25,10 @@ run_step() {
 # Step 0: Build
 if [[ "$STEPS_TO_RUN" == *"0"* ]]; then
     ./scripts/0_build_pdbviz.sh
+    if [ $? -ne 0 ]; then
+        echo "Error building PDBViz"
+        exit 1
+    fi
 fi
 
 # Step 1

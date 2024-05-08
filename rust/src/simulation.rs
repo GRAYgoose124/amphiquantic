@@ -2,6 +2,8 @@ use wgpu::util::DeviceExt;
 use bytemuck::{Pod, Zeroable};
 use pollster;
 
+use crate::utilities::shader::SIMULATE_SHADER;
+
 /// Parameters required for molecular dynamics simulation
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -19,7 +21,7 @@ pub fn run_simulation(
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
 
-    let shader = include_str!("../data/gpu/simulate.wgsl");
+    let shader = SIMULATE_SHADER.clone();
 
     // Load the shader
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

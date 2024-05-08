@@ -1,7 +1,11 @@
+use std::f32::MIN;
+
 use wgpu::util::DeviceExt;
 use pollster;
 use bytemuck;
 use bytemuck::{Pod, Zeroable};
+
+use crate::utilities::shader::MINIMIZE_SHADER;
 
 /// Parameters required for energy minimization
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -24,7 +28,7 @@ pub fn minimize_energy(
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
 
-    let shader = include_str!("../data/gpu/minimize.wgsl");
+    let shader = MINIMIZE_SHADER.clone();
 
     // Load the shader
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

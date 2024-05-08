@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 pub mod atom;
-pub mod utils;
+pub mod shader;
 pub mod bonds;
 
 
