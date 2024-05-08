@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import argparse
 
-from amphiquantic.molecule.plot import plot_molecule
+from amphiquantic.molecule.plot import plot_atoms
 
 from rustquantic import utilities as ut, builder as bd
 from rustquantic import PdbFilePy
@@ -35,10 +35,4 @@ if __name__ == "__main__":
         atom_types.append("Na")
 
     assert len(coords) == len(atom_types)
-
-    # create new pdb file
-    new_pdb_file = PdbFilePy(coords, atom_types, bonds)
-    new_pdb_file.write("new.pdb", False)
-
-    # plot
-    plot_molecule("new.pdb", explicit_bonds=args.no_explicit_bonds)
+    plot_atoms(coords, atom_types, bonds)
