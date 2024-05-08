@@ -35,7 +35,7 @@ pub fn find_possible_ion_locations(
     atom_types: &mut Vec<String>,
 ) -> Vec<(f64, f64, f64)> {
    // don't randomly place, use bond data to find possible locations
-    let bond_distances = BOND_DISTANCES.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<String, (f64, f64)>>();
+    let _bond_distances = BOND_DISTANCES.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<String, (f64, f64)>>();
     let avg_bond_distances = AVG_BOND_DISTANCES.iter().map(|(k, v)| (k.clone(), *v)).collect::<HashMap<String, f64>>();
 
     let threshold = 0.2;

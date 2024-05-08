@@ -45,7 +45,7 @@ pub fn run_simulation(
 
     // Prepare data for GPU
     let coords_data: Vec<f32> = coords.iter().flat_map(|(x, y, z)| vec![*x as f32, *y as f32, *z as f32]).collect();
-    let buffer_size = (coords_data.len() * std::mem::size_of::<f32>()) as u64;
+    let _buffer_size = (coords_data.len() * std::mem::size_of::<f32>()) as u64;
 
     let coords_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Coords Buffer"),
