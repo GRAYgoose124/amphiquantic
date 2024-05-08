@@ -2,17 +2,19 @@ import matplotlib.pyplot as plt
 
 
 # from amphiquantic.molecule.bonds import determine_bonds
-from rustquantic import determine_bonds, parse_pdb_file, utilities as ut
+from rustquantic import PdbFilePy, utilities as ut
 
 ATOM_PROPERTIES = ut.load_atom_properties()
 
 
 def plot_molecule(filename, explicit_bonds=True):
     # coords, atom_types = parse_pdb_file(filename)
-    ((coords, atom_types), bonds) = parse_pdb_file(filename)
+    pdb_file = PdbFilePy.parse(filename)
+    coords = pdb_file.get_coords()
+    atom_types = pdb_file.get_atom_types()
     if not explicit_bonds:
         print("Ignoring explicit bonds and determining bonds automatically.")
-        bonds, near, missing = determine_bonds(coords, atom_types)
+        pdb_file.determine_bonds()
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -36,7 +38,7 @@ def plot_molecule(filename, explicit_bonds=True):
         )
 
     # Plot bonds
-    for start, end in bonds:
+    for start, end in pdb_file.get_bonds():
         xs, ys, zs = zip(coords[start], coords[end])
         ax.plot(xs, ys, zs, color="black")
 
@@ -51,9 +53,11 @@ def plot_molecule(filename, explicit_bonds=True):
 def plot_molecule_with_py3dmol(filename):
     import py3Dmol
 
-    (coords, atom_types), bonds = parse_pdb_file(filename)
-
-    # bonds, _, _ = determine_bonds(coords, atom_types)
+    pdb_file = PdbFilePy.parse(filename)
+    pdb_file.determine_bonds()
+    bonds = pdb_file.get_bonds()
+    coords = pdb_file.get_coords()
+    atom_types = pdb_file.get_atom_types()
 
     view = py3Dmol.view(width=800, height=400)
     for i, (x, y, z) in enumerate(coords):
