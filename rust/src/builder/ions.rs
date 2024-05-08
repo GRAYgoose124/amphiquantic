@@ -1,8 +1,7 @@
 use rand::Rng;
 use std::collections::HashMap;
 
-use crate::bonds::AVG_BOND_DISTANCES;
-use crate::bonds::BOND_DISTANCES;
+use crate::utilities::bonds::{BOND_DISTANCES, AVG_BOND_DISTANCES};
 
 /// Add ions to a structure to neutralize the system or achieve a specific concentration.
 pub fn add_ions(

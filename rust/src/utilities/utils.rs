@@ -14,3 +14,4 @@ pub(crate) fn get_atom_properties_path() -> String {
     let data_path = get_data_path();
     format!("{}/atom_properties.yml", data_path)
 }
+
