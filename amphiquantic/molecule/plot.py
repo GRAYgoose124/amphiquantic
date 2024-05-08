@@ -10,11 +10,10 @@ ATOM_PROPERTIES = ut.load_atom_properties()
 def plot_molecule(filename, explicit_bonds=True):
     # coords, atom_types = parse_pdb_file(filename)
     pdb_file = PdbFilePy.parse(filename)
-    coords = pdb_file.get_coords()
-    atom_types = pdb_file.get_atom_types()
+    coords, atom_types = pdb_file.coords, pdb_file.atom_types
     if not explicit_bonds:
         print("Ignoring explicit bonds and determining bonds automatically.")
-        pdb_file.determine_bonds()
+        bonds, _, _ = pdb_file.determine_bonds()
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -38,7 +37,7 @@ def plot_molecule(filename, explicit_bonds=True):
         )
 
     # Plot bonds
-    for start, end in pdb_file.get_bonds():
+    for start, end in bonds:
         xs, ys, zs = zip(coords[start], coords[end])
         ax.plot(xs, ys, zs, color="black")
 

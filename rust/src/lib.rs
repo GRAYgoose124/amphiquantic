@@ -10,6 +10,7 @@ mod atom;
 mod bonds;
 mod pdb;
 mod utils;
+mod builder;
 
 use bonds::{determine_bonds, load_bond_data};
 use atom::load_atom_data;
@@ -52,6 +53,8 @@ fn utilities(_py: Python, m: &PyModule) -> PyResult<()> {
         }
         dict.into()
     }
+
+
 
     m.add_wrapped(wrap_pyfunction!(get_data_path_py))?;
     m.add_wrapped(wrap_pyfunction!(get_bond_distances_path_py))?;
