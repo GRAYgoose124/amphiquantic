@@ -12,7 +12,7 @@ use atom::{load_atom_data, get_atom_properties_path};
 
 pub(crate) fn get_data_path() -> String {
     // append bond_distances.yml to the data path
-     env::var("PDBVIZ_DATA_PATH").unwrap_or_else(|_| "rust/data".to_string())
+     env::var("AMPHI_DATA_PATH").unwrap_or_else(|_| "rust/data".to_string())
 }
 
 
@@ -20,7 +20,7 @@ pub(crate) fn get_data_path() -> String {
 
 
 #[pymodule]
-pub(crate) fn utilities(_py: Python, m: &PyModule) -> PyResult<()> {
+pub(crate) fn utilities(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "get_data_path")]
     fn get_data_path_py(_py: Python) -> String {
         get_data_path()

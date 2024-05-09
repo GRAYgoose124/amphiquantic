@@ -13,8 +13,9 @@ echo -e "\e[1;32mRunning steps: $STEPS_TO_RUN\e[0m"
 echo -e "\e[1;32mStep order: ${STEP_ORDER[*]}\e[0m"
 
 # Set data path
-if [ -z "$PDBVIZ_DATA_PATH" ]; then
-    . ./rust/set_data_path.sh
+if [ -z "$AMPHI_DATA_PATH" ]; then
+    echo -e "\e[1;31mAMPHI_DATA_PATH is not set. Please set it to the path of the data directory.\e[0m"
+    exit 1
 fi
 
 
@@ -22,7 +23,8 @@ fi
 run_step() {
     step=$1
     echo -e "\e[1;32mRunning step $step\e[0m"
-    ./step_scripts/$step.sh
+    # run $AMPHI_DATA_PATH/scripts/steps/$step.sh
+    $AMPHI_STEPS_PATH/$step.sh
     if [ $? -ne 0 ]; then
         exit 1
     fi
