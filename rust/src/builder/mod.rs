@@ -10,7 +10,7 @@ use ions::{add_ions, find_possible_ion_locations};
 use solvation::solvate_box;
 
 #[pymodule]
-pub fn builder(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn builder(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "add_ions")]
     fn add_ions_py(coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, ion: &str, number: usize) -> (Vec<(f64, f64, f64)>, Vec<String>) {
         let mut coords = coords;

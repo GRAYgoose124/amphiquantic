@@ -1,2 +1,2 @@
 #!/bin/bash
-./run 0
+./run_steps 0

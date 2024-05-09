@@ -61,8 +61,8 @@ pub fn parse_pdb(file_path: &str) -> PdbFilePy {
 #[pyfunction]
 pub fn adjust_coordinates_tuple(
     coords: Vec<(f64, f64, f64)>,
-    fill_size: &PyTuple,
-    margin: &PyTuple
+    fill_size: Bound<PyTuple>,
+    margin: Bound<PyTuple>
 ) -> Vec<(f64, f64, f64)> {
     let fill_size: (f64, f64) = (
         fill_size.get_item(0).unwrap().extract().unwrap(),
@@ -133,7 +133,7 @@ impl PdbFilePy {
     }
 
 
-    pub fn adjust_coordinates(&mut self, fill_size: &PyTuple, margin: &PyTuple) {
+    pub fn adjust_coordinates(&mut self, fill_size: Bound<PyTuple>, margin: Bound<PyTuple>) {
         self.coords = adjust_coordinates_tuple(self.coords.clone(), fill_size, margin);
     }
 

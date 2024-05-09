@@ -35,4 +35,4 @@ if __name__ == "__main__":
         atom_types.append("Na")
 
     assert len(coords) == len(atom_types)
-    plot_atoms(coords, atom_types, bonds)
+    # plot_atoms(coords, atom_types, bonds)

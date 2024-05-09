@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+DEFAULT_STEPS_TO_RUN="01"
+DEFAULT_STEP_ORDER=("rust_build" "demos/plot_determined_bonds" "minimal/parameterize" "minimal/ionize" "minimal/solvate" "minimal/minimize" "minimal/equilibrate" "minimal/simulate")
+
+STEPS_TO_RUN=${1:-"$DEFAULT_STEPS_TO_RUN"}
+STEP_ORDER_STRING=${2:-"${DEFAULT_STEP_ORDER[*]}"}
+
+# Convert the step order string into an array
+IFS=' ' read -r -a STEP_ORDER <<< "$STEP_ORDER_STRING"
+
+echo -e "\e[1;32mRunning steps: $STEPS_TO_RUN\e[0m"
+echo -e "\e[1;32mStep order: ${STEP_ORDER[*]}\e[0m"
+
+# Set data path
+if [ -z "$PDBVIZ_DATA_PATH" ]; then
+    . ./rust/set_data_path.sh
+fi
+
+
+# Run a single step
+run_step() {
+    step=$1
+    echo -e "\e[1;32mRunning step $step\e[0m"
+    ./step_scripts/$step.sh
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+}
+
+# Parse ranges, multiple items, and expand `*` to all steps
+parse_steps() {
+    steps_to_run="$1"
+    all_indices=$(seq 0 $((${#STEP_ORDER[@]} - 1)))
+
+    if [[ "$steps_to_run" == "*" || "$steps_to_run" == "all" ]]; then
+        echo "$all_indices"
+        return
+    fi
+
+    parsed_steps=()
+    IFS=',' read -ra tokens <<< "$steps_to_run"
+    for token in "${tokens[@]}"; do
+        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            parsed_steps+=($(seq "$start" "$end"))
+        else
+            parsed_steps+=("$token")
+        fi
+    done
+
+    echo "${parsed_steps[*]}"
+}
+
+# Run the steps based on the parsed indices
+indices_to_run=$(parse_steps "$STEPS_TO_RUN")
+for i in $indices_to_run; do
+    step=${STEP_ORDER[$i]}
+    run_step "$step"
+done

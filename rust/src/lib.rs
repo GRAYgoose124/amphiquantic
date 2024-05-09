@@ -20,7 +20,7 @@ use minimization::{minimize_energy, MinimizationParams};
 
 
 #[pymodule]
-fn simulate(_py: Python, m: &PyModule) -> PyResult<()> {
+fn simulate(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "minimize_energy")]
     fn minimize_energy_py(coords: Vec<(f64, f64, f64)>, step_size: f32, max_steps: u32) -> Vec<(f64, f64, f64)> {
         let mut coords = coords;
@@ -47,7 +47,7 @@ fn simulate(_py: Python, m: &PyModule) -> PyResult<()> {
 }
 
 #[pymodule]
-fn rustquantic(_py: Python, m: &PyModule) -> PyResult<()> {
+fn rustquantic(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PdbFilePy>()?;
     m.add_wrapped(wrap_pymodule!(crate::utilities::utilities))?;
     m.add_wrapped(wrap_pymodule!(build))?;

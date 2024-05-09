@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+WORKFLOW_DIR=${1:-"minimal"}
+PREP_SCRIPT="./step_scripts/${WORKFLOW_DIR}/prepare.sh"
+
+
+if [ ! -f $PREP_SCRIPT ]; then
+    echo "No prepare script found for workflow $WORKFLOW_DIR"
+    exit 1
+fi
+
+. $PREP_SCRIPT
+AMPHI_RUN_STEPS=$(echo $AMPHI_RUN_STEPS | sed -e "s/\b\([^ ]\+\)\b/${WORKFLOW_DIR}\/\1/g")
+
+# color
+./run_steps "$AMPHI_STEPS_TO_RUN" "$AMPHI_RUN_STEPS"
