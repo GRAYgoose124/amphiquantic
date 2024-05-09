@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-DEFAULT_STEPS_TO_RUN="*"
-DEFAULT_STEP_ORDER=("rust_build" "demos/plot_determined_bonds" "parameterize" "minimize")
+DEFAULT_STEPS_TO_RUN="01"
+DEFAULT_STEP_ORDER=("rust_build" "demos/plot_determined_bonds" "minimal/parameterize" "minimal/ionize" "minimal/solvate" "minimal/minimize" "minimal/equilibrate" "minimal/simulate")
 
 STEPS_TO_RUN=${1:-"$DEFAULT_STEPS_TO_RUN"}
 STEP_ORDER_STRING=${2:-"${DEFAULT_STEP_ORDER[*]}"}
@@ -31,7 +31,7 @@ parse_steps() {
     steps_to_run="$1"
     all_indices=$(seq 0 $((${#STEP_ORDER[@]} - 1)))
 
-    if [[ "$steps_to_run" == "*" ]]; then
+    if [[ "$steps_to_run" == "*" || "$steps_to_run" == "all" ]]; then
         echo "$all_indices"
         return
     fi
