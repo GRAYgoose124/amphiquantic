@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bytemuck = { version = "1.15.0", features = ["derive"] }
+futures-intrusive = "0.5.0"
 lazy_static = "1.4.0"
 ndarray = "0.15.6"
 nom = "7.1.3"

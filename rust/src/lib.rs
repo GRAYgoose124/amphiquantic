@@ -23,24 +23,27 @@ use minimization::{minimize_energy, MinimizationParams};
 fn simulate(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "minimize_energy")]
     fn minimize_energy_py(coords: Vec<(f64, f64, f64)>, step_size: f32, max_steps: u32) -> Vec<(f64, f64, f64)> {
-        let mut coords = coords;
         let params = MinimizationParams {
             step_size,
             max_steps,
         };
-        minimize_energy(&mut coords, params);
-        coords
+
+        let mut coords_vec: Vec<[f64; 3]> = coords.iter().map(|c| [c.0, c.1, c.2]).collect();
+        minimize_energy(&mut coords_vec, params);
+        coords_vec.iter().map(|c| (c[0], c[1], c[2])).collect()
     }
     
     #[pyfn(m, name = "run_simulation")]
     fn run_simulation_py(coords: Vec<(f64, f64, f64)>, time_step: f32, num_steps: u32) -> Vec<(f64, f64, f64)> {
-        let mut coords = coords;
+        let coords = coords;
         let params = SimulationParams {
-            time_step,
-            num_steps,
+            step_size: time_step,
+            max_steps: num_steps,
         };
-        run_simulation(&mut coords, params);
-        coords
+
+        let mut coords_vec: Vec<[f64; 3]> = coords.iter().map(|c| [c.0, c.1, c.2]).collect();
+        run_simulation(&mut coords_vec, params);
+        coords_vec.iter().map(|c| (c[0], c[1], c[2])).collect()
     }
 
     Ok(())

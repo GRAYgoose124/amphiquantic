@@ -6,6 +6,15 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> coords: array<vec3<f32>>;
 @group(0) @binding(1) var<uniform> params: Params;
 
+fn lennard_jones_force(pos1: vec3<f32>, pos2: vec3<f32>) -> vec3<f32> {
+    let r = distance(pos1, pos2);
+    let r_inv = 1.0 / r;
+    let r_inv6 = r_inv * r_inv * r_inv * r_inv * r_inv * r_inv;
+    let r_inv12 = r_inv6 * r_inv6;
+    let force_scalar = 24.0 * (2.0 * r_inv12 - r_inv6) * r_inv;
+    return force_scalar * (pos1 - pos2);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.x;
@@ -15,8 +24,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var step: u32 = 0u;
     while (step < params.max_steps) {
-        // Dummy minimization logic (replace with actual force calculation)
-        coords[index] = coords[index] + vec3<f32>(params.step_size, params.step_size, params.step_size);
+        var force: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+
+        for (var i: u32 = 0u; i < arrayLength(&coords); i = i + 1u) {
+            if (i != index) {
+                force = force + lennard_jones_force(coords[index], coords[i]);
+            }
+        }
+
+        coords[index] = coords[index] + force * params.step_size;
         step = step + 1u;
     }
 }

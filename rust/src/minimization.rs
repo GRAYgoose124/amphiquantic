@@ -1,5 +1,3 @@
-
-
 use wgpu::util::DeviceExt;
 use pollster;
 use bytemuck;
@@ -15,59 +13,54 @@ pub struct MinimizationParams {
     pub max_steps: u32,
 }
 
-
-
-
-
-/// Perform energy minimization using a GPU
 pub fn minimize_energy(
-    coords: &mut Vec<(f64, f64, f64)>,
+    coords: &mut Vec<[f64; 3]>,
     params: MinimizationParams,
 ) {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).unwrap();
-
-    let shader = MINIMIZE_SHADER.clone();
-
-    // Load the shader
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Minimization Shader"),
-        source: wgpu::ShaderSource::Wgsl(shader.into()),
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        dx12_shader_compiler: wgpu::Dx12Compiler::Fxc,
+        flags: wgpu::InstanceFlags::empty(),
+        gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
     });
 
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Pipeline Layout"),
-        bind_group_layouts: &[],
-        push_constant_ranges: &[],
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })).expect("Failed to find an appropriate adapter");
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        label: None,
+    }, None)).expect("Failed to create device");
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(MINIMIZE_SHADER.as_str().into()),
     });
 
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Compute Pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: "main",
-        compilation_options: Default::default(),
+    let coord_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Coordinate Buffer"),
+        contents: bytemuck::cast_slice(&coords),
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
     });
 
-    // Prepare data for GPU
-    let coords_data: Vec<f32> = coords.iter().flat_map(|(x, y, z)| vec![*x as f32, *y as f32, *z as f32]).collect();
-    let _buffer_size = (coords_data.len() * std::mem::size_of::<f32>()) as u64;
-
-    let coords_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Coords Buffer"),
-        contents: bytemuck::cast_slice(&coords_data),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    let result_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Result Buffer"),
+        size: (coords.len() * std::mem::size_of::<[f64; 3]>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
 
-    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Params Buffer"),
+    let param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Parameter Buffer"),
         contents: bytemuck::bytes_of(&params),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Bind Group Layout"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -90,52 +83,69 @@ pub fn minimize_energy(
                 count: None,
             },
         ],
+        label: None,
     });
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Bind Group"),
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: coords_buffer.as_entire_binding(),
+                resource: coord_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: params_buffer.as_entire_binding(),
+                resource: param_buffer.as_entire_binding(),
             },
         ],
+        label: None,
     });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Command Encoder"),
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
     });
+
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: "main",
+        compilation_options: Default::default(),
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
     {
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Compute Pass"),
-            timestamp_writes: None
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
         });
-        compute_pass.set_pipeline(&pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups((coords.len() as u32 + 63) / 64, 1, 1);
+        cpass.set_pipeline(&compute_pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups((coords.len() as u32 + 63) / 64, 1, 1);
     }
+
+    encoder.copy_buffer_to_buffer(&coord_buffer, 0, &result_buffer, 0, (coords.len() * std::mem::size_of::<[f64; 3]>()) as wgpu::BufferAddress);
 
     queue.submit(Some(encoder.finish()));
 
-    // Read back data
-    let buffer_slice = coords_buffer.slice(..);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| sender.send(result).unwrap());
+    // Read back the data
+    let buffer_slice = result_buffer.slice(..);
+    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+
     device.poll(wgpu::Maintain::Wait);
 
-    if receiver.recv().unwrap().is_ok() {
+    if let Some(Ok(())) = pollster::block_on(receiver.receive()) {
         let data = buffer_slice.get_mapped_range();
-        let updated_coords: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        let result: Vec<[f64; 3]> = bytemuck::cast_slice(&data).to_vec();
         coords.clear();
-        for chunk in updated_coords.chunks(3) {
-            coords.push((chunk[0] as f64, chunk[1] as f64, chunk[2] as f64));
-        }
+        coords.extend(result);
+        drop(data); // Drop the mapped range before unmapping
+        result_buffer.unmap();
     }
-    coords_buffer.unmap();
 }
