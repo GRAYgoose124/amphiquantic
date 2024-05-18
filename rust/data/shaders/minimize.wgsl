@@ -1,10 +1,14 @@
-struct Params {
+struct SimulationParams {
     step_size: f32,
     max_steps: u32,
+    process_type: u32,
 };
 
+
 @group(0) @binding(0) var<storage, read_write> coords: array<vec3<f32>>;
-@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(1) var<uniform> params: SimulationParams;
+@group(0) @binding(2) var<storage, read> atom_types: array<u32>;
+@group(0) @binding(3) var<storage, read> bond_indices: array<u32>;
 
 fn lennard_jones_force(pos1: vec3<f32>, pos2: vec3<f32>) -> vec3<f32> {
     let r = distance(pos1, pos2);

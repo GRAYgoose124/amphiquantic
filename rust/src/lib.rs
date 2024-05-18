@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::wrap_pymodule;
+use pyo3::types::PyDict;
 
 use pyo3::Python;
 
@@ -8,45 +11,69 @@ mod atom;
 mod bonds;
 mod pdb;
 mod builder;
-mod minimization;
-mod simulation;
+mod compute_pipeline;
 mod utilities;
 
 
 use pdb::PdbFilePy;
 use builder::builder as build;
-use simulation::{run_simulation, SimulationParams};
-use minimization::{minimize_energy, MinimizationParams};
+use compute_pipeline::{run_atom_pipeline, AtomPipelineParams};
+
 
 
 #[pymodule]
 fn simulate(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
-    #[pyfn(m, name = "minimize_energy")]
-    fn minimize_energy_py(coords: Vec<(f64, f64, f64)>, step_size: f32, max_steps: u32) -> Vec<(f64, f64, f64)> {
-        let params = MinimizationParams {
-            step_size,
-            max_steps,
-        };
-
-        let mut coords_vec: Vec<[f64; 3]> = coords.iter().map(|c| [c.0, c.1, c.2]).collect();
-        minimize_energy(&mut coords_vec, params);
-        coords_vec.iter().map(|c| (c[0], c[1], c[2])).collect()
+    #[pyfn(m, name = "run_atom_pipeline")]
+    // params should be a dict compatible with ypthon dict
+    fn rap(coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, bonds: Vec<(usize, usize)>, params: AtomPipelineParams) -> Vec<(f64, f64, f64)> {
+        let coords_vec: Vec<[f64; 3]> = coords.iter().map(|c| [c.0, c.1, c.2]).collect();
+        run_atom_pipeline(&coords_vec, &atom_types, &bonds, params).iter().map(|c| (c[0], c[1], c[2])).collect()
     }
     
     #[pyfn(m, name = "run_simulation")]
-    fn run_simulation_py(coords: Vec<(f64, f64, f64)>, time_step: f32, num_steps: u32) -> Vec<(f64, f64, f64)> {
-        let coords = coords;
-        let params = SimulationParams {
-            step_size: time_step,
-            max_steps: num_steps,
-        };
+    fn run_simulation_py(coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, bonds: Vec<(usize, usize)>) -> PyResult<PdbFilePy> {
+        let pdb = rap(coords, atom_types.clone(), bonds.clone(), AtomPipelineParams {
+            step_size: 0.1,
+            max_steps: 100,
+            process_type: 2,
+        });
+        Ok(PdbFilePy {
+            coords: pdb,
+            atom_types: atom_types,
+            bonds: bonds,
+        })
+    }
 
-        let mut coords_vec: Vec<[f64; 3]> = coords.iter().map(|c| [c.0, c.1, c.2]).collect();
-        run_simulation(&mut coords_vec, params);
-        coords_vec.iter().map(|c| (c[0], c[1], c[2])).collect()
+    #[pyfn(m, name = "run_minimization")]
+    fn run_minimization_py(coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, bonds: Vec<(usize, usize)>) -> PyResult<PdbFilePy> {
+        let pdb = rap(coords, atom_types.clone(), bonds.clone(), AtomPipelineParams {
+            step_size: 0.1,
+            max_steps: 100,
+            process_type: 1,
+        });
+        Ok(PdbFilePy {
+            coords: pdb,
+            atom_types: atom_types,
+            bonds: bonds,
+        })
+    }
+
+    #[pyfn(m, name = "run_relaxation")]
+    fn run_relaxation_py(coords: Vec<(f64, f64, f64)>, atom_types: Vec<String>, bonds: Vec<(usize, usize)>) -> PyResult<PdbFilePy> {
+        let pdb = rap(coords, atom_types.clone(), bonds.clone(), AtomPipelineParams {
+            step_size: 0.1,
+            max_steps: 100,
+            process_type: 0,
+        });
+        Ok(PdbFilePy {
+            coords: pdb,
+            atom_types: atom_types,
+            bonds: bonds,
+        })
     }
 
     Ok(())
+
 }
 
 #[pymodule]

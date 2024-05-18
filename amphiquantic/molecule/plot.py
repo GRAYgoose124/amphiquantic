@@ -19,7 +19,7 @@ def plot_molecule(filename, explicit_bonds=True):
         bonds, _, _ = pdb_file.determine_bonds()
     else:
         bonds = pdb_file.bonds
-
+        print(bonds)
     plot_atoms(coords, atom_types, bonds)
 
 

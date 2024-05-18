@@ -27,5 +27,5 @@ if __name__ == "__main__":
     else:
         bonds = pdb_file.bonds
 
-    coords = sm.minimize_energy(coords, step_size=0.1, max_steps=1000)
+    coords = sm.run_minimization(coords, atom_types, bonds)
     plot_atoms(coords, atom_types, bonds)

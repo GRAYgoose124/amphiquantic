@@ -15,4 +15,8 @@ lazy_static::lazy_static! {
         let path = format!("{}/simulate.wgsl", get_shader_path());
         std::fs::read_to_string(path).unwrap()
     };
+    pub(crate) static ref RELAX_SHADER: String = {
+        let path = format!("{}/relax.wgsl", get_shader_path());
+        std::fs::read_to_string(path).unwrap()
+    };
 }

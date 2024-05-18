@@ -1,22 +1,30 @@
+use pyo3::prelude::*;
 use wgpu::util::DeviceExt;
 use pollster;
 use bytemuck;
 use bytemuck::{Pod, Zeroable};
 
 use crate::utilities::shader::MINIMIZE_SHADER;
+use crate::utilities::shader::SIMULATE_SHADER;
+use crate::utilities::shader::RELAX_SHADER;
 
-/// Parameters required for energy minimization
+#[pyclass]
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
-pub struct MinimizationParams {
+pub struct AtomPipelineParams {
     pub step_size: f32,
     pub max_steps: u32,
+    pub process_type: u32, // 0 for relaxation, 1 for minimization, 2 for simulation
 }
 
-pub fn minimize_energy(
-    coords: &mut Vec<[f64; 3]>,
-    params: MinimizationParams,
-) {
+
+
+pub fn run_atom_pipeline(
+    coords: &Vec<[f64; 3]>,
+    atom_types: &Vec<String>,
+    bonds: &Vec<(usize, usize)>,
+    params: AtomPipelineParams,
+) -> Vec<[f64; 3]> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         dx12_shader_compiler: wgpu::Dx12Compiler::Fxc,
@@ -36,10 +44,22 @@ pub fn minimize_energy(
         label: None,
     }, None)).expect("Failed to create device");
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(MINIMIZE_SHADER.as_str().into()),
-    });
+    // pick shader
+    let shader = match params.process_type {
+        0 => device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(RELAX_SHADER.as_str().into()),
+        }),
+        1 => device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(MINIMIZE_SHADER.as_str().into()),
+        }),
+        2 => device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(SIMULATE_SHADER.as_str().into()),
+        }),
+        _ => panic!("Invalid process type"),
+    };
 
     let coord_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Coordinate Buffer"),
@@ -54,9 +74,23 @@ pub fn minimize_energy(
         mapped_at_creation: false,
     });
 
+    let bonds_bytes: Vec<u8> = bonds.iter().flat_map(|(a, b)| vec![*a as u8, *b as u8]).collect();
+    let bonds_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Bonds Buffer"),
+        contents: &bonds_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let atom_types_bytes: Vec<u8> = atom_types.iter().flat_map(|s| s.bytes()).collect();
+    let atom_types_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Atom Types Buffer"),
+        contents: &atom_types_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
     let param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Parameter Buffer"),
-        contents: bytemuck::bytes_of(&params),
+        contents: bytemuck::cast_slice(&[params]),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -82,6 +116,26 @@ pub fn minimize_energy(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
         label: None,
     });
@@ -96,6 +150,14 @@ pub fn minimize_energy(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: param_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: atom_types_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: bonds_buffer.as_entire_binding(),
             },
         ],
         label: None,
@@ -143,9 +205,10 @@ pub fn minimize_energy(
     if let Some(Ok(())) = pollster::block_on(receiver.receive()) {
         let data = buffer_slice.get_mapped_range();
         let result: Vec<[f64; 3]> = bytemuck::cast_slice(&data).to_vec();
-        coords.clear();
-        coords.extend(result);
-        drop(data); // Drop the mapped range before unmapping
+        drop(data);
         result_buffer.unmap();
+        result
+    } else {
+        panic!("Failed to read result buffer");
     }
 }
