@@ -18,7 +18,7 @@ pub struct AtomProperties {
 
 impl ToPyObject for AtomProperties {
     fn to_object(&self, py: Python) -> PyObject {
-        let dict = PyDict::new(py);
+        let dict = PyDict::new_bound(py);
         dict.set_item("color", self.color.to_object(py)).unwrap();
         dict.set_item("radius", self.radius.to_object(py)).unwrap();
         dict.set_item("valence", self.valence.to_object(py)).unwrap();

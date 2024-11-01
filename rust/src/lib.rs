@@ -1,11 +1,6 @@
-use std::collections::HashMap;
-
 use pyo3::prelude::*;
 use pyo3::wrap_pymodule;
-use pyo3::types::PyDict;
-
 use pyo3::Python;
-
 
 mod atom;
 mod bonds;
@@ -14,11 +9,9 @@ mod builder;
 mod compute_pipeline;
 mod utilities;
 
-
 use pdb::PdbFilePy;
 use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, AtomPipelineParams};
-
 
 
 #[pymodule]

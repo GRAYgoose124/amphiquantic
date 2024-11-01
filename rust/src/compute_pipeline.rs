@@ -42,6 +42,7 @@ pub fn run_atom_pipeline(
         required_features: wgpu::Features::empty(),
         required_limits: wgpu::Limits::default(),
         label: None,
+        memory_hints: wgpu::MemoryHints::default(),
     }, None)).expect("Failed to create device");
 
     // pick shader
@@ -173,8 +174,9 @@ pub fn run_atom_pipeline(
         label: None,
         layout: Some(&pipeline_layout),
         module: &shader,
-        entry_point: "main",
+        entry_point: Some("main"),
         compilation_options: Default::default(),
+        cache: None,
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

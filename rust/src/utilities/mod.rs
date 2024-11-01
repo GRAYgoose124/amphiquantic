@@ -39,7 +39,7 @@ pub(crate) fn utilities(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "load_bond_distances")]
     fn load_bond_data_py(_py: Python) -> Py<PyDict> {
         let bond_data = load_bond_data();
-        let dict = PyDict::new(_py);
+        let dict = PyDict::new_bound(_py);
         for (key, value) in bond_data.iter() {
             dict.set_item(key, value).unwrap();
         }
@@ -49,7 +49,7 @@ pub(crate) fn utilities(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     #[pyfn(m, name = "load_atom_properties")]
     fn load_atom_data_py(_py: Python) -> Py<PyDict> {
         let atom_data = load_atom_data();
-        let dict = PyDict::new(_py);
+        let dict = PyDict::new_bound(_py);
         for (key, value) in atom_data.iter() {
             dict.set_item(key, value.to_object(_py)).unwrap();
         }

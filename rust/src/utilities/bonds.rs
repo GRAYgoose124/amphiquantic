@@ -15,7 +15,7 @@ pub struct BondDistances {
 
 impl ToPyObject for BondDistances {
     fn to_object(&self, py: Python) -> PyObject {
-        let dict = PyDict::new(py);
+        let dict = PyDict::new_bound(py);
         for (key, value) in self.bond_distances.iter() {
             dict.set_item(key, value).unwrap();
         }
