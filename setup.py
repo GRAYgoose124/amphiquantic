@@ -7,5 +7,5 @@ setup(
     description="A molecular visualization tool for PDB files.",
     author="Grayson Miller",
     author_email="grayson.miller124@gmail.com",
-    install_requires=["numpy", "matplotlib", "mpl_toolkits"],
+    install_requires=["numpy", "matplotlib"],
 )

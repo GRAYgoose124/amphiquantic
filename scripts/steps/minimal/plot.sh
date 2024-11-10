@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # make simple pdb file
 echo """
 ATOM      1  N   ALA A   1      64.000  64.000  64.000  1.00  0.00           N
@@ -9,4 +11,4 @@ ATOM      4  O   ALA A   1      61.000  61.000  61.000  1.00  0.00           O
 # run python script
 ./bin/plot_pdb /tmp/simple.pdb
 
-rm /tmp/simple.pdb
+# rm /tmp/simple.pdb
