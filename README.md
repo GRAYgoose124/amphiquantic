@@ -1,0 +1,6 @@
+# Install
+
+```bash
+$ ./build
+$ ./run
+```

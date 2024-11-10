@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-DEFAULT_STEPS_TO_RUN="01"
-DEFAULT_STEP_ORDER=("rust_build" "demos/plot_determined_bonds" "minimal/parameterize" "minimal/ionize" "minimal/solvate" "minimal/minimize" "minimal/equilibrate" "minimal/simulate")
+. $(dirname $0)/steps/settings
 
 STEPS_TO_RUN=${1:-"$DEFAULT_STEPS_TO_RUN"}
 STEP_ORDER_STRING=${2:-"${DEFAULT_STEP_ORDER[*]}"}
@@ -10,7 +9,11 @@ STEP_ORDER_STRING=${2:-"${DEFAULT_STEP_ORDER[*]}"}
 IFS=' ' read -r -a STEP_ORDER <<< "$STEP_ORDER_STRING"
 
 echo -e "\e[1;32mRunning steps: $STEPS_TO_RUN\e[0m"
-echo -e "\e[1;32mStep order: ${STEP_ORDER[*]}\e[0m"
+numbered_steps=()
+for i in "${!STEP_ORDER[@]}"; do
+    numbered_steps+=("$i.${STEP_ORDER[$i]}")
+done
+echo -e "\e[1;32mStep order: ${numbered_steps[*]}\e[0m"
 
 # Set data path
 if [ -z "$AMPHI_DATA_PATH" ]; then

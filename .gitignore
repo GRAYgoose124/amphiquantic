@@ -2,3 +2,5 @@
 *.pyc
 *git-ignored*
 *.lock
+.venv
+target/*

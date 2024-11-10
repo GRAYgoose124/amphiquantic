@@ -1,6 +1,4 @@
 #!/bin/bash
 
-# pip install -e .
-
 . ./rust/set_data_path.sh
-./scripts/run_steps 0
+./scripts/run_steps 0-1

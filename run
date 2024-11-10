@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 . ./rust/set_data_path.sh
-./scripts/run_steps 
+. ./amphiquantic/python_activate.sh
+
+./scripts/run_steps $*

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+DEFAULT_STEPS_TO_RUN="1-2"
+DEFAULT_STEP_ORDER=("python_install" "rust_build" "demos/plot_determined_bonds" "minimal/parameterize" "minimal/ionize" "minimal/solvate" "minimal/minimize" "minimal/equilibrate" "minimal/simulate")
