@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-. ./rust/set_data_path.sh
-. ./amphiquantic/python_activate.sh
 
+# if not run from amphiquantic root, fail
+if [ $(basename $(pwd)) != "amphiquantic" ]; then
+    echo "Please run this script from the root of the project."
+    exit 1
+fi
+
+if [ ! -d ".venv" ]; then
+    ./build 
+else
+    . ./rust/set_data_path.sh
+fi
+
+. ./python/python_activate.sh
 ./scripts/run_steps $*
