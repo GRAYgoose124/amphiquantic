@@ -4,6 +4,7 @@ use pyo3::wrap_pymodule;
 mod bonds;
 mod builder;
 mod compute_pipeline;
+mod constraints;
 mod electrostatics;
 mod forces;
 mod integrator;
@@ -16,7 +17,7 @@ mod utilities;
 
 use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, run_md, AtomPipelineParams};
-use integrator::{initialize_velocities, langevin_step, MdState};
+use integrator::{langevin_step, velocity_verlet_step, MdState};
 use minimize::minimize;
 use pdb::PdbFilePy;
 use topology::{Topology, TopologyPy};
@@ -25,6 +26,18 @@ use trajectory::TrajectoryWriter;
 #[pyfunction]
 fn load_topology(path: &str) -> PyResult<TopologyPy> {
     TopologyPy::read(path)
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, output=None))]
+fn ionize_topology(path: &str, output: Option<&str>) -> PyResult<TopologyPy> {
+    let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    top.neutralize();
+    if let Some(out) = output {
+        top.write(out)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    }
+    Ok(TopologyPy { inner: top })
 }
 
 #[pyfunction]
@@ -69,13 +82,7 @@ fn equilibrate_topology(
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     let n_steps = steps.unwrap_or(100);
     let temp = temperature.unwrap_or(300.0);
-    let mut state = MdState {
-        topology: top.clone(),
-        velocities: initialize_velocities(&top, temp),
-        temperature: temp,
-        timestep: 0.002,
-        friction: 1.0,
-    };
+    let mut state = MdState::new(top.clone(), temp);
     let mut writer = output_traj.map(TrajectoryWriter::new);
     for step in 0..n_steps {
         let res = langevin_step(&mut state, 1.0);
@@ -96,7 +103,22 @@ fn simulate_topology(
     steps: Option<u64>,
     temperature: Option<f64>,
 ) -> PyResult<TopologyPy> {
-    equilibrate_topology(path, output_traj, steps, temperature)
+    let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    let n_steps = steps.unwrap_or(100);
+    let temp = temperature.unwrap_or(300.0);
+    let mut state = MdState::new(top.clone(), temp);
+    state.use_constraints = true;
+    state.npt = false;
+    let mut writer = output_traj.map(TrajectoryWriter::new);
+    for step in 0..n_steps {
+        let res = velocity_verlet_step(&mut state, 1.0);
+        if let Some(w) = writer.as_mut() {
+            w.write_frame(step, &state.topology, res.potential_energy, res.kinetic_energy)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        }
+    }
+    top = state.topology;
+    Ok(TopologyPy { inner: top })
 }
 
 #[pymodule]
@@ -164,6 +186,7 @@ fn simulate(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
 fn rustquantic(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PdbFilePy>()?;
     m.add_class::<TopologyPy>()?;
+    m.add_function(wrap_pyfunction_bound!(ionize_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(load_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(minimize_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(equilibrate_topology, &m)?)?;

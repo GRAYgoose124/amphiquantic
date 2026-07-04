@@ -1,4 +1,4 @@
-use crate::integrator::{initialize_velocities, langevin_step, MdState};
+use crate::integrator::{langevin_step, MdState};
 use crate::minimize::minimize;
 use crate::topology::Topology;
 use bytemuck::{Pod, Zeroable};
@@ -46,16 +46,9 @@ pub fn run_md(
         }
         0 | 2 => {
             let temp = if process_type == 0 { 300.0 } else { 310.0 };
-            let mut state = MdState {
-                topology: top,
-                velocities: initialize_velocities(
-                    &Topology::from_pdb_types(coords, atom_types, bonds),
-                    temp,
-                ),
-                temperature: temp,
-                timestep: step_size,
-                friction: if process_type == 0 { 2.0 } else { 1.0 },
-            };
+            let mut state = MdState::new(top, temp);
+            state.timestep = step_size;
+            state.friction = if process_type == 0 { 2.0 } else { 1.0 };
             for _ in 0..max_steps {
                 langevin_step(&mut state, 1.0);
             }

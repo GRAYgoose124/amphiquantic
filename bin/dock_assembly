@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Assemble protein-protein complex (LightDock or geometric fallback)."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from amphiquantic.docking.assembly import dock_assembly
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Protein-protein assembly")
+    p.add_argument("chain_a", type=str, help="First chain PDB")
+    p.add_argument("chain_b", type=str, help="Second chain PDB")
+    p.add_argument("-o", "--output", type=str, default="complex.pdb")
+    p.add_argument(
+        "--method",
+        choices=["auto", "lightdock", "geometric"],
+        default="auto",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    try:
+        out = dock_assembly(args.chain_a, args.chain_b, args.output, method=args.method)
+        print(f"Wrote {out}")
+    except Exception as exc:
+        print(f"dock_assembly failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

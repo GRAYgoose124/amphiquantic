@@ -9,6 +9,15 @@ from amphiquantic.topology.bootstrap_assign import (
 )
 
 
+def _openff_available() -> bool:
+    try:
+        import openff.toolkit  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Parameterize a structure → .aqtop")
     parser.add_argument("input", type=str, help="PDB file or SMILES string")
@@ -17,9 +26,19 @@ def parse_args():
     parser.add_argument("--forcefield", type=str, default="openff-2.2.1.offxml")
     parser.add_argument("--from-smiles", action="store_true")
     parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Use bootstrap tables (no OpenFF)",
+    )
+    parser.add_argument(
         "--openff",
         action="store_true",
-        help="Use OpenFF Sage (requires amphiquantic[openff])",
+        help="Use OpenFF Sage (default when toolkit installed)",
+    )
+    parser.add_argument(
+        "--protein",
+        action="store_true",
+        help="Protein parameterization via protein_ff (requires --extra protein)",
     )
     return parser.parse_args()
 
@@ -28,16 +47,21 @@ if __name__ == "__main__":
     args = parse_args()
     inp = Path(args.input)
     out = args.output or str(inp.with_suffix(".aqtop"))
+    use_openff = args.openff or (not args.bootstrap and _openff_available())
 
-    if args.from_smiles or inp.suffix.lower() != ".pdb":
-        if args.openff:
-            from amphiquantic.topology import parameterize_from_smiles
+    if args.protein:
+        from amphiquantic.topology.protein_ff import parameterize_protein_pdb
+
+        parameterize_protein_pdb(inp, out, forcefield=args.forcefield)
+    elif args.from_smiles or inp.suffix.lower() != ".pdb":
+        if use_openff:
+            from amphiquantic.topology.openff_assign import parameterize_from_smiles
 
             parameterize_from_smiles(args.input, out, forcefield=args.forcefield)
         else:
             parameterize_from_smiles_bootstrap(args.input, out)
-    elif args.openff:
-        from amphiquantic.topology import parameterize_from_pdb
+    elif use_openff:
+        from amphiquantic.topology.openff_assign import parameterize_from_pdb
 
         parameterize_from_pdb(inp, out, forcefield=args.forcefield, smiles=args.smiles)
     else:

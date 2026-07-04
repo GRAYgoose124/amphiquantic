@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# FOSS validation harness: compare amphiquantic .aqtop energy to GROMACS when available.
+# FOSS validation harness: export structures for GROMACS comparison.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 AQTOP="${1:-tests/fixtures/methane.aqtop}"
 OUTDIR="${2:-/tmp/amphi-gmx-val}"
 
+mkdir -p "$OUTDIR"
+uv run python tests/validation/export_for_gromacs.py "$AQTOP" "$OUTDIR"
+
 if ! command -v gmx >/dev/null 2>&1 && ! command -v gromacs >/dev/null 2>&1; then
-  echo "GROMACS not installed — skipping CLI validation (export-only mode)"
-  mkdir -p "$OUTDIR"
-  uv run python tests/validation/export_for_gromacs.py "$AQTOP" "$OUTDIR"
+  echo "GROMACS not installed — exported coordinates to $OUTDIR/system.gro"
+  echo "Tier B: install GROMACS and compare single-point energy manually."
   exit 0
 fi
 
 GMX=$(command -v gmx || command -v gromacs)
-mkdir -p "$OUTDIR"
-uv run python tests/validation/export_for_gromacs.py "$AQTOP" "$OUTDIR"
-
-echo "GROMACS validation stub: structures exported to $OUTDIR"
-echo "Run manual grompp/mdrun against $OUTDIR/system.gro when topology export is extended."
+echo "Exported $OUTDIR/system.gro"
+echo "Next: build matching .top and run:"
+echo "  $GMX grompp -f em.mdp -c $OUTDIR/system.gro -p $OUTDIR/system.top -o $OUTDIR/tpr"
+echo "  $GMX mdrun -deffnm $OUTDIR/em -nb cpu"

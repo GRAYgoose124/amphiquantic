@@ -2,14 +2,13 @@
 import argparse
 from pathlib import Path
 
-from rustquantic import PdbFilePy, Topology, builder as bd
+from rustquantic import ionize_topology, load_topology
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Add ions to neutralize system charge")
-    parser.add_argument("input", type=str, help="PDB or .aqtop")
+    parser.add_argument("input", type=str, help=".aqtop input")
     parser.add_argument("-o", "--output", type=str, default=None)
-    parser.add_argument("--ionic-strength", type=float, default=0.15, help="Molar (placeholder)")
     return parser.parse_args()
 
 
@@ -18,27 +17,17 @@ def main():
     path = Path(args.input)
     out = args.output or str(path.with_suffix(".ion.aqtop"))
 
-    if path.suffix == ".aqtop":
-        from rustquantic import load_topology
+    if path.suffix != ".aqtop":
+        raise SystemExit("ionize requires .aqtop input with force field terms")
 
-        top = load_topology(str(path))
-        charge = top.net_charge()
-        coords, atom_types, bonds = top.to_pdb_types()
-    else:
-        pdb = PdbFilePy.parse(str(path))
-        coords, atom_types = pdb.coords, pdb.atom_types
-        bonds, _, _ = pdb.determine_bonds()
-        top = Topology.from_pdb_types(coords, atom_types, bonds)
-        charge = top.net_charge()
-
-    n_ions = int(round(abs(charge)))
-    if n_ions > 0:
-        ion = "Cl" if charge > 0 else "Na"
-        coords, atom_types = bd.add_ions(coords, atom_types, ion, n_ions)
-
-    top = Topology.from_pdb_types(coords, atom_types, bonds)
-    top.write(out)
-    print(f"Wrote {out} (added {n_ions} ions for charge {charge:.2f})")
+    before = load_topology(str(path))
+    n_atoms_before = before.num_atoms()
+    top = ionize_topology(str(path), out)
+    after = load_topology(out)
+    print(
+        f"Wrote {out} ({n_atoms_before} -> {after.num_atoms()} atoms, "
+        f"net charge {after.net_charge():.4f})"
+    )
 
 
 if __name__ == "__main__":

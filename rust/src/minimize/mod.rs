@@ -38,6 +38,9 @@ pub fn minimize(
             atom.position[0] += step_size * force[0];
             atom.position[1] += step_size * force[1];
             atom.position[2] += step_size * force[2];
+            if topology.box_.pbc {
+                crate::electrostatics::apply_pbc(&mut atom.position, &topology.box_);
+            }
         }
     }
 

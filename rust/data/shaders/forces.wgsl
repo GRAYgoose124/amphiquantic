@@ -2,7 +2,12 @@ struct SimulationParams {
     num_atoms: u32,
     num_pairs: u32,
     cutoff: f32,
-    _pad: f32,
+    box_lx: f32,
+    box_ly: f32,
+    box_lz: f32,
+    pbc: u32,
+    use_screened: u32,
+    alpha: f32,
 }
 
 struct AtomParams {
@@ -20,18 +25,31 @@ struct AtomParams {
 
 const COULOMB: f32 = 138.935456;
 
-fn lj_force_energy(pos_i: vec3<f32>, pos_j: vec3<f32>, sigma: f32, epsilon: f32) -> vec4<f32> {
-    let dr = pos_j - pos_i;
-    let r2 = dot(dr, dr);
-    let r = max(sqrt(r2), 1e-12);
-    let sr = sigma / r;
-    let sr2 = sr * sr;
-    let sr6 = sr2 * sr2 * sr2;
-    let sr12 = sr6 * sr6;
-    let force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-    let f = force_scalar * dr;
-    let energy = 4.0 * epsilon * (sr12 - sr6);
-    return vec4<f32>(f, energy);
+fn erfc_approx(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.5 * abs(x));
+    let tau = t * exp(-x * x - 1.26551223
+        + t * (1.00002368
+        + t * (0.37409196
+        + t * (0.09678418
+        + t * (-0.18628806
+        + t * (0.27886807
+        + t * (-1.13520398
+        + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+    return select(2.0 - tau, tau, x >= 0.0);
+}
+
+fn mic(dr: vec3<f32>) -> vec3<f32> {
+    if (sim.pbc == 0u) {
+        return dr;
+    }
+    var out = dr;
+    if (out.x > 0.5 * sim.box_lx) { out.x -= sim.box_lx; }
+    if (out.x < -0.5 * sim.box_lx) { out.x += sim.box_lx; }
+    if (out.y > 0.5 * sim.box_ly) { out.y -= sim.box_ly; }
+    if (out.y < -0.5 * sim.box_ly) { out.y += sim.box_ly; }
+    if (out.z > 0.5 * sim.box_lz) { out.z -= sim.box_lz; }
+    if (out.z < -0.5 * sim.box_lz) { out.z += sim.box_lz; }
+    return out;
 }
 
 @compute @workgroup_size(64)
@@ -42,7 +60,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var total_force = vec3<f32>(0.0);
-    var pos_i = coords[atom].xyz;
+    let pos_i = coords[atom].xyz;
     let pi = atom_params[atom];
 
     var p: u32 = 0u;
@@ -54,8 +72,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let pj = atom_params[other];
             let sigma = 0.5 * (pi.sigma + pj.sigma);
             let epsilon = sqrt(pi.epsilon * pj.epsilon);
-            let pos_j = coords[other].xyz;
-            var dr = pos_j - pos_i;
+            var dr = coords[other].xyz - pos_i;
+            dr = mic(dr);
             if (i == atom) {
                 dr = -dr;
             }
@@ -65,7 +83,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let sr6 = pow(sr, 6.0);
             let sr12 = sr6 * sr6;
             let lj = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-            let coulomb = COULOMB * pi.charge * pj.charge / r2;
+            var coulomb = COULOMB * pi.charge * pj.charge / r2;
+            if (sim.use_screened == 1u) {
+                let arg = sim.alpha * r;
+                let erfc_val = erfc_approx(arg);
+                coulomb = COULOMB * pi.charge * pj.charge * (
+                    erfc_val / r2 + 2.0 * sim.alpha * exp(-arg * arg) / (sqrt(3.14159265) * r)
+                );
+            }
             let sign = select(-1.0, 1.0, i == atom);
             total_force += sign * (lj + coulomb) * normalize(dr);
         }

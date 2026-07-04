@@ -17,6 +17,16 @@ build-backend = "setuptools.build_meta"
 openff = [
     "openff-toolkit @ git+https://github.com/openforcefield/openff-toolkit.git@0.16.8",
 ]
+protein = [
+    "openmmforcefields>=0.12.0",
+    "pdbfixer>=1.9",
+]
+docking = [
+    "rdkit",
+    "meeko>=0.5.0",
+    "pdbfixer>=1.9",
+    "openmm>=8.0",
+]
 test = [
     "pytest>=8.0",
 ]
@@ -39,5 +49,9 @@ markers = [
     "rust: requires rustquantic extension",
     "gpu: requires wgpu backend",
     "openff: requires openff-toolkit optional extra",
+    "hybrid: requires hybrid CPU+GPU path",
+    "pme: PME-enabled tests (slow)",
+    "docking: requires --extra docking tools installed",
+    "complex: full complex fixtures (slow, tier_b)",
     "slow: skipped by agent_verify --fast",
 ]

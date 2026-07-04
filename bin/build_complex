@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Merge receptor + ligand .aqtop files into a complex."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from amphiquantic.docking.pose_to_topology import pose_to_topology
+from amphiquantic.topology.complex_builder import build_complex
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Build enzyme-ligand complex .aqtop")
+    p.add_argument("components", nargs="+", help="Component .aqtop files")
+    p.add_argument("-o", "--output", required=True, help="Output complex .aqtop")
+    p.add_argument(
+        "--ligand-pose",
+        type=str,
+        default=None,
+        help="Docked pose PDBQT/SDF applied to second component",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    components = list(args.components)
+    out = Path(args.output)
+
+    if args.ligand_pose and len(components) >= 2:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".aqtop", delete=False) as tmp:
+            tmp_path = tmp.name
+        pose_to_topology(components[1], args.ligand_pose, tmp_path)
+        components[1] = tmp_path
+
+    try:
+        merged = build_complex(components, out)
+        print(f"Wrote {out} ({len(merged['atoms'])} atoms)")
+    except Exception as exc:
+        print(f"build_complex failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

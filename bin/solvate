@@ -3,14 +3,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from rustquantic import PdbFilePy, builder as bd
+from amphiquantic.topology.io import load_topology, save_topology
+from amphiquantic.topology.solvate import solvate_topology
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Solvate a system in a water box")
-    parser.add_argument("input", type=str, help="PDB or .aqtop input")
-    parser.add_argument("-o", "--output", type=str, default=None, help="Output .aqtop or PDB")
-    parser.add_argument("--box-size", type=float, default=1.2, help="Padding distance (nm-ish scale)")
+    parser = argparse.ArgumentParser(description="Solvate a system in a TIP3P water box")
+    parser.add_argument("input", type=str, help=".aqtop input")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output .aqtop")
+    parser.add_argument("--padding", type=float, default=1.0, help="Padding distance (nm-ish)")
+    parser.add_argument("--spacing", type=float, default=3.0, help="Water grid spacing (Å)")
     return parser.parse_args()
 
 
@@ -19,23 +21,14 @@ def main():
     path = Path(args.input)
     out = args.output or str(path.with_suffix(".solv.aqtop"))
 
-    if path.suffix == ".aqtop":
-        from rustquantic import load_topology
+    if path.suffix != ".aqtop":
+        print("solvate requires .aqtop input with bonded terms", file=sys.stderr)
+        sys.exit(1)
 
-        top = load_topology(str(path))
-        coords, atom_types, bonds = top.to_pdb_types()
-    else:
-        pdb = PdbFilePy.parse(str(path))
-        coords, atom_types = pdb.coords, pdb.atom_types
-        bonds, _, _ = pdb.determine_bonds()
-
-    coords, atom_types = bd.solvate_box(coords, atom_types, args.box_size)
-
-    from rustquantic import Topology
-
-    top = Topology.from_pdb_types(coords, atom_types, bonds)
-    top.write(out)
-    print(f"Wrote {out}")
+    top = load_topology(path)
+    solvated = solvate_topology(top, padding=args.padding, spacing=args.spacing)
+    save_topology(out, solvated)
+    print(f"Wrote {out} ({len(solvated['atoms'])} atoms)")
 
 
 if __name__ == "__main__":

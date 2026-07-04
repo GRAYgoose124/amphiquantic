@@ -1,0 +1,376 @@
+{
+  "version": 1,
+  "metadata": {
+    "source": "dipeptide_fixture",
+    "merged_molecules": 4,
+    "solvent": "TIP3P"
+  },
+  "box": {
+    "lx": 3.3,
+    "ly": 3.15,
+    "lz": 3.0,
+    "pbc": true
+  },
+  "atoms": [
+    {
+      "element": "N",
+      "name": "N",
+      "mass": 14,
+      "charge": -0.3,
+      "sigma": 0.325,
+      "epsilon": 0.711,
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "C",
+      "name": "CA",
+      "mass": 12,
+      "charge": 0.1,
+      "sigma": 0.34,
+      "epsilon": 0.36,
+      "position": [
+        0.15,
+        0,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "C",
+      "name": "C",
+      "mass": 12,
+      "charge": 0.5,
+      "sigma": 0.34,
+      "epsilon": 0.36,
+      "position": [
+        0.3,
+        0.15,
+        0
+      ],
+      "residue_id": 1,
+      "molecule_id": 0
+    },
+    {
+      "element": "O",
+      "name": "OW",
+      "mass": 15.999,
+      "charge": -0.834,
+      "sigma": 3.166,
+      "epsilon": 0.65,
+      "position": [
+        -1.5,
+        -1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 1
+    },
+    {
+      "element": "H",
+      "name": "HW1",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        -0.5428,
+        -1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 1
+    },
+    {
+      "element": "H",
+      "name": "HW2",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        -1.7399872,
+        -0.57337279,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 1
+    },
+    {
+      "element": "O",
+      "name": "OW",
+      "mass": 15.999,
+      "charge": -0.834,
+      "sigma": 3.166,
+      "epsilon": 0.65,
+      "position": [
+        -1.5,
+        1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 2
+    },
+    {
+      "element": "H",
+      "name": "HW1",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        -0.5428,
+        1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 2
+    },
+    {
+      "element": "H",
+      "name": "HW2",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        -1.7399872,
+        2.42662721,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 2
+    },
+    {
+      "element": "O",
+      "name": "OW",
+      "mass": 15.999,
+      "charge": -0.834,
+      "sigma": 3.166,
+      "epsilon": 0.65,
+      "position": [
+        1.5,
+        -1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 3
+    },
+    {
+      "element": "H",
+      "name": "HW1",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        2.4572000000000003,
+        -1.5,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 3
+    },
+    {
+      "element": "H",
+      "name": "HW2",
+      "mass": 1.008,
+      "charge": 0.417,
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "position": [
+        1.2600128,
+        -0.57337279,
+        -1.5
+      ],
+      "residue_id": 0,
+      "molecule_id": 3
+    }
+  ],
+  "bonds": [
+    {
+      "i": 0,
+      "j": 1,
+      "k": 400,
+      "r0": 0.14
+    },
+    {
+      "i": 1,
+      "j": 2,
+      "k": 400,
+      "r0": 0.15
+    },
+    {
+      "i": 3,
+      "j": 4,
+      "k": 462753.4,
+      "r0": 0.9572
+    },
+    {
+      "i": 3,
+      "j": 5,
+      "k": 462753.4,
+      "r0": 0.9572
+    },
+    {
+      "i": 6,
+      "j": 7,
+      "k": 462756.4,
+      "r0": 0.9572
+    },
+    {
+      "i": 6,
+      "j": 8,
+      "k": 462756.4,
+      "r0": 0.9572
+    },
+    {
+      "i": 9,
+      "j": 10,
+      "k": 462759.4,
+      "r0": 0.9572
+    },
+    {
+      "i": 9,
+      "j": 11,
+      "k": 462759.4,
+      "r0": 0.9572
+    }
+  ],
+  "angles": [
+    {
+      "i": 0,
+      "j": 1,
+      "k": 2,
+      "k_theta": 300,
+      "theta0": 1.9
+    },
+    {
+      "i": 4,
+      "j": 3,
+      "k": 5,
+      "k_theta": 836.8,
+      "theta0": 1.824218134
+    },
+    {
+      "i": 7,
+      "j": 6,
+      "k": 8,
+      "k_theta": 836.8,
+      "theta0": 1.824218134
+    },
+    {
+      "i": 10,
+      "j": 9,
+      "k": 11,
+      "k_theta": 836.8,
+      "theta0": 1.824218134
+    }
+  ],
+  "dihedrals": [],
+  "impropers": [],
+  "exclusions": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      2,
+      1
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      3,
+      4
+    ],
+    [
+      4,
+      3
+    ],
+    [
+      3,
+      5
+    ],
+    [
+      5,
+      3
+    ],
+    [
+      4,
+      5
+    ],
+    [
+      5,
+      4
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      7,
+      6
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      8,
+      6
+    ],
+    [
+      7,
+      8
+    ],
+    [
+      8,
+      7
+    ],
+    [
+      9,
+      10
+    ],
+    [
+      10,
+      9
+    ],
+    [
+      9,
+      11
+    ],
+    [
+      11,
+      9
+    ],
+    [
+      10,
+      11
+    ],
+    [
+      11,
+      10
+    ]
+  ]
+}

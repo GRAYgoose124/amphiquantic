@@ -36,7 +36,7 @@ echo "==> cargo test"
 
 MARKER_EXPR="tier_a"
 if [[ "$FAST" -eq 1 ]]; then
-  MARKER_EXPR="tier_a and not slow and not openff and not tier_b"
+  MARKER_EXPR="tier_a and not slow and not openff and not tier_b and not pme and not complex"
 fi
 if [[ "$GPU_ONLY" -eq 1 ]]; then
   MARKER_EXPR="gpu"

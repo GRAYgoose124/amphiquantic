@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Dock a ligand into a receptor active site (Vina-class orchestration)."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from amphiquantic.docking.ligand import dock_ligand
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Dock ligand into receptor")
+    p.add_argument("receptor", type=str, help="Receptor PDB")
+    p.add_argument("ligand", type=str, help="Ligand SMILES or file")
+    p.add_argument("--out", type=str, default="poses.pdbqt", help="Output poses file")
+    p.add_argument("--box", type=str, default="auto", help="auto or cx,cy,cz")
+    p.add_argument("--size", type=float, default=20.0, help="Box edge length (Å)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    center = None
+    if args.box != "auto":
+        parts = [float(x) for x in args.box.split(",")]
+        center = (parts[0], parts[1], parts[2])
+    try:
+        out = dock_ligand(
+            args.receptor,
+            args.ligand,
+            args.out,
+            box_center=center,
+            box_size=(args.size, args.size, args.size),
+        )
+        print(f"Wrote {out}")
+    except Exception as exc:
+        print(f"dock_ligand failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

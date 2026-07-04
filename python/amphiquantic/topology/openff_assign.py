@@ -5,12 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from amphiquantic.topology.interchange_export import create_interchange, interchange_to_aqtop
 from amphiquantic.topology.io import AQTOP_VERSION, save_topology
 
 DEFAULT_FF = "openff-2.2.1.offxml"
 
-# Lorentz-Berthelot sigma (nm) and epsilon (kJ/mol) by element — bootstrap values
-# aligned with OpenFF / SMIRKS typical orders of magnitude for validation bootstrap.
+# Bootstrap LJ tables (fallback when Interchange unavailable)
 LJ_BY_ELEMENT: dict[str, tuple[float, float]] = {
     "H": (0.106, 0.066),
     "C": (0.339, 0.457),
@@ -32,19 +32,17 @@ def _lj(element: str) -> tuple[float, float]:
     return LJ_BY_ELEMENT.get(element, (0.34, 0.36))
 
 
-def _extract_topology(offmol, ff_name: str, source: str, smiles: str | None) -> dict[str, Any]:
+def _extract_topology_fallback(offmol, ff_name: str, source: str, smiles: str | None) -> dict[str, Any]:
+    """Legacy bootstrap when Interchange export fails."""
     from openff.toolkit import ForceField
 
     ff = ForceField(ff_name)
     offmol.assign_partial_charges(partial_charge_method="gasteiger")
-
     if offmol.n_conformers == 0:
         offmol.generate_conformers(n_conformers=1)
-
     conformer = offmol.conformers[0]
     coords = conformer.m_as("angstrom")
-
-    atoms: list[dict[str, Any]] = []
+    atoms = []
     for idx, atom in enumerate(offmol.atoms):
         sigma, epsilon = _lj(atom.symbol)
         x, y, z = coords[idx]
@@ -57,37 +55,38 @@ def _extract_topology(offmol, ff_name: str, source: str, smiles: str | None) -> 
                 "sigma": sigma,
                 "epsilon": epsilon,
                 "position": [float(x), float(y), float(z)],
-                "residue_id": int(getattr(atom, "metadata", {}).get("residue_number", 0) or 0),
+                "residue_id": 0,
                 "molecule_id": 0,
             }
         )
-
-    bonds: list[dict[str, Any]] = []
+    bonds = []
     for bond in offmol.bonds:
-        i = bond.atom1_index
-        j = bond.atom2_index
-        length = offmol.get_bond_length(bond).m_as("nanometer") * 10.0  # angstrom
+        i, j = bond.atom1_index, bond.atom2_index
+        length = offmol.get_bond_length(bond).m_as("nanometer") * 10.0
         bonds.append({"i": i, "j": j, "k": 500.0, "r0": float(length)})
-
-    exclusions: list[list[int]] = []
+    exclusions = []
     for b in bonds:
         exclusions.append([b["i"], b["j"]])
         exclusions.append([b["j"], b["i"]])
-
     return {
         "version": AQTOP_VERSION,
-        "metadata": {
-            "openff_version": ff_name,
-            "source": source,
-            "smiles": smiles,
-        },
+        "metadata": {"openff_version": ff_name, "source": source, "smiles": smiles},
         "box": {"lx": 0.0, "ly": 0.0, "lz": 0.0, "pbc": False},
         "atoms": atoms,
         "bonds": bonds,
         "angles": [],
         "dihedrals": [],
+        "impropers": [],
         "exclusions": exclusions,
     }
+
+
+def _extract_topology(offmol, ff_name: str, source: str, smiles: str | None) -> dict[str, Any]:
+    try:
+        interchange, _ = create_interchange(offmol, ff_name)
+        return interchange_to_aqtop(offmol, interchange, ff_name, source, smiles)
+    except Exception:
+        return _extract_topology_fallback(offmol, ff_name, source, smiles)
 
 
 def parameterize_from_smiles(

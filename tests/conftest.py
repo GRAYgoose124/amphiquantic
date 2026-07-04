@@ -22,6 +22,10 @@ def pytest_configure(config):
         "gpu": "Requires wgpu GPU backend",
         "openff": "Requires openff-toolkit optional extra",
         "slow": "Skipped by agent_verify --fast",
+        "hybrid": "Requires hybrid CPU+GPU parallel path",
+        "pme": "PME-enabled tests (slow)",
+        "docking": "Docking orchestration tests",
+        "complex": "Full complex fixtures (slow, tier_b)",
     }.items():
         config.addinivalue_line("markers", f"{name}: {doc}")
 

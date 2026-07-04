@@ -26,7 +26,7 @@ Fast loop while iterating:
 | Orchestration | `scripts/steps/` | bash workflow steps |
 | Tests | `tests/` | pytest tiers + validation |
 
-**Primary compute:** wgpu (`AMPHI_FORCE_BACKEND=gpu`, default). **Reference:** CPU (`AMPHI_FORCE_BACKEND=cpu`).
+**Primary compute:** hybrid (`AMPHI_HYBRID=1`, default) — CPU bonded/PME + GPU nonbonded. **Reference:** CPU-only (`AMPHI_FORCE_BACKEND=cpu`).
 
 ## TDD protocol (mandatory)
 
@@ -60,7 +60,8 @@ See [`agents/verification-checklist.md`](agents/verification-checklist.md) for t
 
 | Variable | Values | Purpose |
 |----------|--------|---------|
-| `AMPHI_FORCE_BACKEND` | `gpu` (default), `cpu` | Force evaluation backend |
+| `AMPHI_FORCE_BACKEND` | `hybrid` (default), `cpu`, `gpu` | Force evaluation backend |
+| `AMPHI_HYBRID` | `1` (default on), `0` | CPU bonded + GPU nonbonded parallel |
 | `AMPHI_SKIP_OPENFF` | `1` | Skip OpenFF tests in CI |
 | `AMPHI_DATA_PATH` | path | YAML/shaders data (set by `./build`) |
 
@@ -73,6 +74,10 @@ See [`agents/verification-checklist.md`](agents/verification-checklist.md) for t
 | `rust` | Needs `rustquantic` extension |
 | `gpu` | Needs wgpu / GPU backend |
 | `openff` | Needs `uv sync --extra openff` |
+| `hybrid` | Hybrid CPU+GPU force path |
+| `pme` | PME electrostatics (slow) |
+| `docking` | Docking orchestration tests |
+| `complex` | Full complex fixtures (tier_b) |
 | `slow` | Long-running; skip with `--fast` |
 
 ## Skill
