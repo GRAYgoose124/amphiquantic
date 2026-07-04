@@ -1,31 +1,35 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
+from pathlib import Path
 
 from amphiquantic.molecule.plot import plot_atoms
-
-from rustquantic import utilities as ut, builder as bd, simulate as sm
-from rustquantic import PdbFilePy
+from rustquantic import PdbFilePy, minimize_topology, load_topology
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
-    parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
-    parser.add_argument(
-        "--no-explicit-bonds",
-        action="store_false",
-        help="Plot explicit bonds between atoms",
-    )
+    parser = argparse.ArgumentParser(description="Minimize a structure using wgpu forces")
+    parser.add_argument("input", type=str, help="PDB or .aqtop")
+    parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--plot", action="store_true", help="Show matplotlib plot")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    pdb_file = PdbFilePy.parse(args.pdb_file)
-    coords, atom_types = pdb_file.coords, pdb_file.atom_types
-    if args.no_explicit_bonds:
-        bonds, _, _ = pdb_file.determine_bonds()
-    else:
-        bonds = pdb_file.bonds
+    path = Path(args.input)
 
-    coords = sm.run_minimization(coords, atom_types, bonds)
-    plot_atoms(coords, atom_types, bonds)
+    if path.suffix == ".aqtop":
+        out = args.output or str(path.with_suffix(".min.aqtop"))
+        top, energy, iters = minimize_topology(str(path), out)
+        coords, atom_types, bonds = top.to_pdb_types()
+        print(f"Minimized in {iters} steps, E={energy:.4f} kJ/mol")
+    else:
+        pdb = PdbFilePy.parse(str(path))
+        coords, atom_types = pdb.coords, pdb.atom_types
+        bonds, _, _ = pdb.determine_bonds()
+        from rustquantic import simulate as sm
+
+        coords = sm.run_minimization(coords, atom_types, bonds)
+
+    if args.plot or path.suffix != ".aqtop":
+        plot_atoms(coords, atom_types, bonds)

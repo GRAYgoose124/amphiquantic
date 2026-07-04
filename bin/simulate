@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+
+from rustquantic import simulate_topology
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Production MD simulation")
+    parser.add_argument("input", type=str, help=".aqtop topology")
+    parser.add_argument("-o", "--trajectory", type=str, default=None)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--temperature", type=float, default=300.0)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    path = Path(args.input)
+    traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
+    top = simulate_topology(str(path), traj, args.steps, args.temperature)
+    out = str(path.with_suffix(".md.aqtop"))
+    top.write(out)
+    print(f"Simulated → {out}, trajectory {traj}")

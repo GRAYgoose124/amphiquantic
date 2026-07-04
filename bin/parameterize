@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from pathlib import Path
+
+from amphiquantic.topology.bootstrap_assign import (
+    parameterize_from_pdb_bootstrap,
+    parameterize_from_smiles_bootstrap,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Parameterize a structure → .aqtop")
+    parser.add_argument("input", type=str, help="PDB file or SMILES string")
+    parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--smiles", type=str, default=None)
+    parser.add_argument("--forcefield", type=str, default="openff-2.2.1.offxml")
+    parser.add_argument("--from-smiles", action="store_true")
+    parser.add_argument(
+        "--openff",
+        action="store_true",
+        help="Use OpenFF Sage (requires amphiquantic[openff])",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    inp = Path(args.input)
+    out = args.output or str(inp.with_suffix(".aqtop"))
+
+    if args.from_smiles or inp.suffix.lower() != ".pdb":
+        if args.openff:
+            from amphiquantic.topology import parameterize_from_smiles
+
+            parameterize_from_smiles(args.input, out, forcefield=args.forcefield)
+        else:
+            parameterize_from_smiles_bootstrap(args.input, out)
+    elif args.openff:
+        from amphiquantic.topology import parameterize_from_pdb
+
+        parameterize_from_pdb(inp, out, forcefield=args.forcefield, smiles=args.smiles)
+    else:
+        parameterize_from_pdb_bootstrap(inp, out)
+    print(f"Wrote {out}")

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 if [ ! -d ".venv" ]; then
-    echo "No virtual environment found. Run ./scripts/steps/python_install.sh first."
-    echo "The easiest way to do this is to run ./build"
+    echo "No virtual environment found. Run ./build first (or: uv sync)."
     exit 1
 fi
 
+# uv creates and manages .venv by default
 . .venv/bin/activate

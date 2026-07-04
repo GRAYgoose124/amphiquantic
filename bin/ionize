@@ -1,38 +1,45 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
+from pathlib import Path
 
-from amphiquantic.molecule.plot import plot_atoms
-
-from rustquantic import utilities as ut, builder as bd
-from rustquantic import PdbFilePy
+from rustquantic import PdbFilePy, Topology, builder as bd
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Visualize a molecule from a PDB file")
-    parser.add_argument("pdb_file", type=str, help="Path to the PDB file")
-    parser.add_argument(
-        "--no-explicit-bonds",
-        action="store_false",
-        help="Plot explicit bonds between atoms",
-    )
+    parser = argparse.ArgumentParser(description="Add ions to neutralize system charge")
+    parser.add_argument("input", type=str, help="PDB or .aqtop")
+    parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--ionic-strength", type=float, default=0.15, help="Molar (placeholder)")
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
-    pdb_file = PdbFilePy.parse(args.pdb_file)
-    coords, atom_types = pdb_file.coords, pdb_file.atom_types
-    if args.no_explicit_bonds:
-        bonds, _, _ = pdb_file.determine_bonds()
+    path = Path(args.input)
+    out = args.output or str(path.with_suffix(".ion.aqtop"))
+
+    if path.suffix == ".aqtop":
+        from rustquantic import load_topology
+
+        top = load_topology(str(path))
+        charge = top.net_charge()
+        coords, atom_types, bonds = top.to_pdb_types()
     else:
-        bonds = pdb_file.bonds
+        pdb = PdbFilePy.parse(str(path))
+        coords, atom_types = pdb.coords, pdb.atom_types
+        bonds, _, _ = pdb.determine_bonds()
+        top = Topology.from_pdb_types(coords, atom_types, bonds)
+        charge = top.net_charge()
 
-    # ions
-    ion_coords = bd.find_possible_ion_locations(coords, atom_types)
-    print("Found %d possible ion locations" % len(ion_coords))
-    for ion_coord in ion_coords:
-        coords.append(ion_coord)
-        atom_types.append("Na")
+    n_ions = int(round(abs(charge)))
+    if n_ions > 0:
+        ion = "Cl" if charge > 0 else "Na"
+        coords, atom_types = bd.add_ions(coords, atom_types, ion, n_ions)
 
-    assert len(coords) == len(atom_types)
-    # plot_atoms(coords, atom_types, bonds)
+    top = Topology.from_pdb_types(coords, atom_types, bonds)
+    top.write(out)
+    print(f"Wrote {out} (added {n_ions} ions for charge {charge:.2f})")
+
+
+if __name__ == "__main__":
+    main()

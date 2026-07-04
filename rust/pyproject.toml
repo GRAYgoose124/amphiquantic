@@ -3,8 +3,9 @@ requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pdbviz"
-requires-python = ">=3.7"
+name = "rustquantic"
+version = "0.1.0"
+requires-python = ">=3.10,<3.14"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",

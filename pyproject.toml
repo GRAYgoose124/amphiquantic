@@ -1,0 +1,43 @@
+[project]
+name = "amphiquantic"
+version = "0.1.0"
+description = "A python package for molecular modeling."
+authors = [{ name = "Grayson Miller", email = "grayson.miller124@gmail.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+openff = [
+    "openff-toolkit @ git+https://github.com/openforcefield/openff-toolkit.git@0.16.8",
+]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["amphiquantic*"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.1,<2.0",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "tier_a: fast CI tests (agent_verify default)",
+    "tier_b: manual GROMACS / slow validation",
+    "rust: requires rustquantic extension",
+    "gpu: requires wgpu backend",
+    "openff: requires openff-toolkit optional extra",
+    "slow: skipped by agent_verify --fast",
+]

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from pathlib import Path
+
+from rustquantic import PdbFilePy, builder as bd
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Solvate a system in a water box")
+    parser.add_argument("input", type=str, help="PDB or .aqtop input")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Output .aqtop or PDB")
+    parser.add_argument("--box-size", type=float, default=1.2, help="Padding distance (nm-ish scale)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    path = Path(args.input)
+    out = args.output or str(path.with_suffix(".solv.aqtop"))
+
+    if path.suffix == ".aqtop":
+        from rustquantic import load_topology
+
+        top = load_topology(str(path))
+        coords, atom_types, bonds = top.to_pdb_types()
+    else:
+        pdb = PdbFilePy.parse(str(path))
+        coords, atom_types = pdb.coords, pdb.atom_types
+        bonds, _, _ = pdb.determine_bonds()
+
+    coords, atom_types = bd.solvate_box(coords, atom_types, args.box_size)
+
+    from rustquantic import Topology
+
+    top = Topology.from_pdb_types(coords, atom_types, bonds)
+    top.write(out)
+    print(f"Wrote {out}")
+
+
+if __name__ == "__main__":
+    main()
