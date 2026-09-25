@@ -7,11 +7,25 @@ use std::path::Path;
 
 pub const AQTOP_VERSION: u32 = 1;
 
+/// OBC-II effective Born radius from intrinsic radius (nm).
+fn obc2_effective_born_r(rho: f64) -> f64 {
+    let rho = rho.max(0.05);
+    let one = rho;
+    let psi = one * one * rho;
+    let psi = rho - psi;
+    let tanh = (psi * 0.8).tanh();
+    (rho - 0.005909 * tanh).max(0.05)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopologyMetadata {
     pub openff_version: Option<String>,
     pub source: Option<String>,
     pub smiles: Option<String>,
+    #[serde(default)]
+    pub solvation_model: Option<String>,
+    #[serde(default)]
+    pub dielectric: Option<f64>,
 }
 
 impl Default for TopologyMetadata {
@@ -20,6 +34,8 @@ impl Default for TopologyMetadata {
             openff_version: None,
             source: None,
             smiles: None,
+            solvation_model: None,
+            dielectric: None,
         }
     }
 }
@@ -54,6 +70,8 @@ pub struct AtomRecord {
     pub position: [f64; 3],
     pub residue_id: u32,
     pub molecule_id: u32,
+    #[serde(default)]
+    pub born_r: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,6 +136,35 @@ impl Topology {
         self.atoms.iter().map(|a| a.charge).sum()
     }
 
+    pub fn is_implicit_gb(&self) -> bool {
+        matches!(
+            self.metadata.solvation_model.as_deref(),
+            Some("gb_obc2") | Some("gb")
+        )
+    }
+
+    pub fn solvent_dielectric(&self) -> f64 {
+        self.metadata.dielectric.unwrap_or(78.5)
+    }
+
+    pub fn effective_born_r(&self, idx: usize) -> f64 {
+        let atom = &self.atoms[idx];
+        let rho = atom.born_r.unwrap_or(0.15);
+        obc2_effective_born_r(rho)
+    }
+
+    /// Virtual charge neutralization for implicit solvent (no ion atoms).
+    pub fn neutralize_virtual(&mut self) {
+        let charge = self.net_charge();
+        if charge.abs() < 1e-9 || self.atoms.is_empty() {
+            return;
+        }
+        let delta = -charge / self.atoms.len() as f64;
+        for atom in &mut self.atoms {
+            atom.charge += delta;
+        }
+    }
+
     pub fn positions(&self) -> Vec<[f64; 3]> {
         self.atoms.iter().map(|a| a.position).collect()
     }
@@ -131,13 +178,39 @@ impl Topology {
     pub fn read(path: impl AsRef<Path>) -> Result<Self, String> {
         let file = File::open(path.as_ref()).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader).map_err(|e| e.to_string())
+        let mut top: Self = serde_json::from_reader(reader).map_err(|e| e.to_string())?;
+        if top.exclusions.is_empty() && (!top.bonds.is_empty() || !top.angles.is_empty()) {
+            top.build_exclusions();
+        }
+        Ok(top)
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let mut top = self.clone();
+        top.sanitize_non_finite();
         let file = File::create(path.as_ref()).map_err(|e| e.to_string())?;
         let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, self).map_err(|e| e.to_string())
+        serde_json::to_writer_pretty(writer, &top).map_err(|e| e.to_string())
+    }
+
+    /// Replace NaN/Inf coords and box lengths so JSON round-trips stay valid.
+    pub fn sanitize_non_finite(&mut self) {
+        for atom in &mut self.atoms {
+            for c in &mut atom.position {
+                if !c.is_finite() {
+                    *c = 0.0;
+                }
+            }
+        }
+        if !self.box_.lx.is_finite() {
+            self.box_.lx = 0.0;
+        }
+        if !self.box_.ly.is_finite() {
+            self.box_.ly = 0.0;
+        }
+        if !self.box_.lz.is_finite() {
+            self.box_.lz = 0.0;
+        }
     }
 
     pub fn from_pdb_types(
@@ -157,6 +230,7 @@ impl Topology {
                 position: [*x, *y, *z],
                 residue_id: 0,
                 molecule_id: 0,
+                born_r: None,
             });
         }
         for &(i, j) in bonds {
@@ -225,11 +299,16 @@ impl Topology {
                 position: pos,
                 residue_id: 0,
                 molecule_id: mol_id + idx as u32,
+                born_r: None,
             });
         }
     }
 
     pub fn neutralize(&mut self) {
+        if self.is_implicit_gb() {
+            self.neutralize_virtual();
+            return;
+        }
         let charge = self.net_charge();
         let n = charge.round().abs() as usize;
         if n == 0 {
@@ -459,9 +538,51 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         let json = serde_json::to_string(&top).unwrap();
         let parsed: Topology = serde_json::from_str(&json).unwrap();
         assert_eq!(top, parsed);
+    }
+
+    #[test]
+    fn read_builds_missing_exclusions() {
+        let mut top = Topology::new();
+        top.atoms.push(AtomRecord {
+            element: "C".into(),
+            name: "C1".into(),
+            mass: 12.0,
+            charge: 0.0,
+            sigma: 0.34,
+            epsilon: 0.36,
+            position: [0.0, 0.0, 0.0],
+            residue_id: 0,
+            molecule_id: 0,
+            born_r: None,
+        });
+        top.atoms.push(AtomRecord {
+            element: "C".into(),
+            name: "C2".into(),
+            mass: 12.0,
+            charge: 0.0,
+            sigma: 0.34,
+            epsilon: 0.36,
+            position: [0.15, 0.0, 0.0],
+            residue_id: 0,
+            molecule_id: 0,
+            born_r: None,
+        });
+        top.bonds.push(BondTerm {
+            i: 0,
+            j: 1,
+            k: 500.0,
+            r0: 0.15,
+        });
+        top.exclusions.clear();
+        let path = std::env::temp_dir().join("amphi_excl_test.aqtop");
+        top.write(&path).unwrap();
+        let loaded = Topology::read(&path).unwrap();
+        assert!(!loaded.exclusions.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

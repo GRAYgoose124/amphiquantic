@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "metadata": {
+    "source": "CCO",
+    "openff_version": "bootstrap",
+    "smiles": "CCO"
+  },
+  "box": {
+    "lx": 0,
+    "ly": 0,
+    "lz": 0,
+    "pbc": false
+  },
+  "atoms": [
+    {
+      "element": "C",
+      "name": "C1",
+      "mass": 12.011,
+      "charge": 0,
+      "sigma": 0.339,
+      "epsilon": 0.457,
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "C",
+      "name": "C2",
+      "mass": 12.011,
+      "charge": 0,
+      "sigma": 0.339,
+      "epsilon": 0.457,
+      "position": [
+        0.15,
+        0,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "O",
+      "name": "O1",
+      "mass": 15.999,
+      "charge": 0,
+      "sigma": 0.296,
+      "epsilon": 0.879,
+      "position": [
+        0.25,
+        0.12,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H1",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        -0.09,
+        -0.05,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H2",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        0.2,
+        -0.08,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H3",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        0.32,
+        0.05,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H4",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        0.28,
+        0.2,
+        0
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H5",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        0.35,
+        0.08,
+        0.1
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    },
+    {
+      "element": "H",
+      "name": "H6",
+      "mass": 1.008,
+      "charge": 0,
+      "sigma": 0.106,
+      "epsilon": 0.066,
+      "position": [
+        0.35,
+        0.08,
+        -0.1
+      ],
+      "residue_id": 0,
+      "molecule_id": 0
+    }
+  ],
+  "bonds": [
+    {
+      "i": 0,
+      "j": 1,
+      "k": 500,
+      "r0": 0.15
+    },
+    {
+      "i": 1,
+      "j": 2,
+      "k": 500,
+      "r0": 0.14
+    }
+  ],
+  "angles": [],
+  "dihedrals": [],
+  "impropers": [],
+  "exclusions": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      2,
+      1
+    ]
+  ]
+}

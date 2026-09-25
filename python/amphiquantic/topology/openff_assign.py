@@ -5,7 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from amphiquantic.topology.interchange_export import create_interchange, interchange_to_aqtop
+from amphiquantic.topology.interchange_export import (
+    bond_length_angstrom,
+    create_interchange,
+    interchange_to_aqtop,
+)
 from amphiquantic.topology.io import AQTOP_VERSION, save_topology
 
 DEFAULT_FF = "openff-2.2.1.offxml"
@@ -34,9 +38,6 @@ def _lj(element: str) -> tuple[float, float]:
 
 def _extract_topology_fallback(offmol, ff_name: str, source: str, smiles: str | None) -> dict[str, Any]:
     """Legacy bootstrap when Interchange export fails."""
-    from openff.toolkit import ForceField
-
-    ff = ForceField(ff_name)
     offmol.assign_partial_charges(partial_charge_method="gasteiger")
     if offmol.n_conformers == 0:
         offmol.generate_conformers(n_conformers=1)
@@ -62,7 +63,7 @@ def _extract_topology_fallback(offmol, ff_name: str, source: str, smiles: str | 
     bonds = []
     for bond in offmol.bonds:
         i, j = bond.atom1_index, bond.atom2_index
-        length = offmol.get_bond_length(bond).m_as("nanometer") * 10.0
+        length = bond_length_angstrom(offmol, bond)
         bonds.append({"i": i, "j": j, "k": 500.0, "r0": float(length)})
     exclusions = []
     for b in bonds:
@@ -89,14 +90,22 @@ def _extract_topology(offmol, ff_name: str, source: str, smiles: str | None) -> 
         return _extract_topology_fallback(offmol, ff_name, source, smiles)
 
 
+def _molecule_from_smiles(smiles: str):
+    from openff.toolkit import Molecule
+    from openff.toolkit.utils.exceptions import UndefinedStereochemistryError
+
+    try:
+        return Molecule.from_smiles(smiles)
+    except UndefinedStereochemistryError:
+        return Molecule.from_smiles(smiles, allow_undefined_stereo=True)
+
+
 def parameterize_from_smiles(
     smiles: str,
     output: str | Path,
     forcefield: str = DEFAULT_FF,
 ) -> dict[str, Any]:
-    from openff.toolkit import Molecule
-
-    mol = Molecule.from_smiles(smiles)
+    mol = _molecule_from_smiles(smiles)
     mol.generate_conformers(n_conformers=1)
     top = _extract_topology(mol, forcefield, f"smiles:{smiles}", smiles)
     save_topology(output, top)

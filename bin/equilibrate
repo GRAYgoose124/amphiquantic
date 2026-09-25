@@ -12,6 +12,23 @@ def parse_args():
     parser.add_argument("--trajectory", type=str, default=None, help="Output .aqtrj")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=300.0)
+    parser.add_argument(
+        "--restart",
+        type=str,
+        default=None,
+        help="Restart coordinates from .aqtrj last frame",
+    )
+    parser.add_argument(
+        "--restrain",
+        action="store_true",
+        help="Harmonic positional restraints to input coordinates",
+    )
+    parser.add_argument(
+        "--restraint-k",
+        type=float,
+        default=1000.0,
+        help="Restraint force constant kJ/mol/nm^2 (default 1000)",
+    )
     return parser.parse_args()
 
 
@@ -19,7 +36,15 @@ if __name__ == "__main__":
     args = parse_args()
     path = Path(args.input)
     traj = args.trajectory or str(path.with_suffix(".eq.aqtrj"))
-    top = equilibrate_topology(str(path), traj, args.steps, args.temperature)
+    restraint_k = args.restraint_k if args.restrain else None
+    top = equilibrate_topology(
+        str(path),
+        traj,
+        args.steps,
+        args.temperature,
+        args.restart,
+        restraint_k,
+    )
     out = args.output or str(path.with_suffix(".eq.aqtop"))
     top.write(out)
     print(f"Equilibrated → {out}, trajectory {traj}")

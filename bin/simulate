@@ -17,6 +17,12 @@ def parse_args():
         action="store_true",
         help="Enable NPT barostat (experimental)",
     )
+    parser.add_argument(
+        "--restart",
+        type=str,
+        default=None,
+        help="Restart coordinates from .aqtrj last frame",
+    )
     return parser.parse_args()
 
 
@@ -24,7 +30,14 @@ if __name__ == "__main__":
     args = parse_args()
     path = Path(args.input)
     traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
-    top = simulate_topology(str(path), traj, args.steps, args.temperature)
+    top = simulate_topology(
+        str(path),
+        traj,
+        args.steps,
+        args.temperature,
+        args.restart,
+        args.npt,
+    )
     out = args.output or str(path.with_suffix(".md.aqtop"))
     top.write(out)
     print(f"Simulated → {out}, trajectory {traj}")

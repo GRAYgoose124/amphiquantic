@@ -28,6 +28,15 @@ def test_topology_roundtrip(tmp_path, built_extension):
     assert loaded.num_atoms() == 2
 
 
+@pytest.mark.tier_a
+def test_methane_fixture_atom_count(repo_root: Path):
+    import json
+
+    data = json.loads((repo_root / "tests" / "fixtures" / "methane.aqtop").read_text())
+    assert len(data["atoms"]) == 5
+    assert len(data["bonds"]) == 4
+
+
 @pytest.mark.openff
 @pytest.mark.tier_a
 def test_openff_methane_parameterize(tmp_path, built_extension):
@@ -53,46 +62,38 @@ def test_bootstrap_parameterize(tmp_path, ala_pdb: Path):
 @pytest.mark.tier_a
 @pytest.mark.rust
 @pytest.mark.gpu
-def test_cpu_gpu_force_parity(built_extension):
-    from rustquantic import Topology, minimize_topology
+def test_cpu_gpu_force_parity(built_extension, repo_root: Path):
+    import os
+    import subprocess
+    import sys
 
-    top = Topology.from_pdb_types(
-        [(0.0, 0.0, 0.0), (0.2, 0.0, 0.0), (0.0, 0.2, 0.0)],
-        ["C", "C", "H"],
-        [(0, 1)],
-    )
-    path = "/tmp/force_parity.aqtop"
-    top.write(path)
-
+    path = repo_root / "tests" / "fixtures" / "methane.aqtop"
     env_cpu = os.environ.copy()
     env_cpu["AMPHI_FORCE_BACKEND"] = "cpu"
     env_gpu = os.environ.copy()
     env_gpu["AMPHI_FORCE_BACKEND"] = "gpu"
 
-    e_cpu = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"from rustquantic import minimize_topology; print(minimize_topology('{path}')[1])",
-        ],
-        env=env_cpu,
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    e_gpu = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"from rustquantic import minimize_topology; print(minimize_topology('{path}')[1])",
-        ],
-        env=env_gpu,
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
+    def run_energy(env):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"from rustquantic import topology_energy; print(topology_energy('{path}'))",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+
+    e_cpu = run_energy(env_cpu)
+    e_gpu = run_energy(env_gpu)
     assert e_cpu.returncode == 0, e_cpu.stderr
     assert e_gpu.returncode == 0, e_gpu.stderr
+    e_cpu_val = float(e_cpu.stdout.strip())
+    e_gpu_val = float(e_gpu.stdout.strip())
+    denom = max(abs(e_cpu_val), abs(e_gpu_val), 1.0)
+    assert abs(e_cpu_val - e_gpu_val) / denom < 0.5
 
 
 @pytest.mark.tier_a

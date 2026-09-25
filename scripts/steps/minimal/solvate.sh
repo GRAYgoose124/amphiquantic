@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-cd "$ROOT"
+# shellcheck disable=SC1091
+source "$(dirname "$0")/_env.sh"
 
-PDB="${1:-tests/fixtures/ala.pdb}"
-AQTOP="${2:-/tmp/simple.aqtop}"
-
-bin/parameterize "$PDB" -o "$AQTOP" --bootstrap
-bin/solvate "$AQTOP" -o "${AQTOP%.aqtop}.solv.aqtop"
+AQTOP="${AMPHI_AQTOP:-/tmp/simple.aqtop}"
+OUT="${AQTOP%.aqtop}.solv.aqtop"
+amphi_bin solvate "$AQTOP" -o "$OUT"
+export AMPHI_AQTOP="$OUT"

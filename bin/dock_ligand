@@ -13,7 +13,8 @@ def parse_args():
     p.add_argument("receptor", type=str, help="Receptor PDB")
     p.add_argument("ligand", type=str, help="Ligand SMILES or file")
     p.add_argument("--out", type=str, default="poses.pdbqt", help="Output poses file")
-    p.add_argument("--box", type=str, default="auto", help="auto or cx,cy,cz")
+    p.add_argument("--box", type=str, default="auto", help="auto, from-ligand, or cx,cy,cz")
+    p.add_argument("--reference-ligand", type=str, default=None, help="Reference ligand PDB/SDF for box center")
     p.add_argument("--size", type=float, default=20.0, help="Box edge length (Å)")
     return p.parse_args()
 
@@ -21,7 +22,11 @@ def parse_args():
 def main():
     args = parse_args()
     center = None
-    if args.box != "auto":
+    reference_ligand = args.reference_ligand
+    if args.box == "from-ligand" and reference_ligand is None:
+        print("dock_ligand: --box from-ligand requires --reference-ligand", file=sys.stderr)
+        sys.exit(1)
+    if args.box not in ("auto", "from-ligand"):
         parts = [float(x) for x in args.box.split(",")]
         center = (parts[0], parts[1], parts[2])
     try:
@@ -31,6 +36,7 @@ def main():
             args.out,
             box_center=center,
             box_size=(args.size, args.size, args.size),
+            reference_ligand=reference_ligand if args.box == "from-ligand" else None,
         )
         print(f"Wrote {out}")
     except Exception as exc:

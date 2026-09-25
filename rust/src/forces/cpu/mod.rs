@@ -150,6 +150,49 @@ pub fn compute_forces(topology: &Topology, cutoff: f64) -> ForceResult {
     compute_forces_with_pme(topology, cutoff, None)
 }
 
+/// Lennard-Jones nonbonded only (implicit GB path).
+pub fn compute_lj_forces(topology: &Topology, cutoff: f64) -> ForceResult {
+    let n = topology.atoms.len();
+    let mut forces = vec![[0.0f64; 3]; n];
+    let mut potential_energy = 0.0;
+
+    let nl = build_neighbor_list(topology, cutoff);
+    let pairs_14 = build_14_pairs(topology);
+
+    for &(i, j) in &nl.pairs {
+        let pi = topology.atoms[i].position;
+        let pj = topology.atoms[j].position;
+        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+        dr = minimum_image(dr, &topology.box_);
+        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+        let r = r2.sqrt().max(1e-12);
+
+        let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
+        let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+        if pairs_14.contains(&(i.min(j), i.max(j))) {
+            epsilon *= LJ_14_SCALE;
+        }
+
+        if sigma > 1e-8 && epsilon > 1e-12 {
+            let sr = sigma / r;
+            let sr6 = sr.powi(6);
+            let sr12 = sr6 * sr6;
+            let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+            let lj_energy = 4.0 * epsilon * (sr12 - sr6);
+            potential_energy += lj_energy;
+            for k in 0..3 {
+                forces[i][k] -= lj_force_scalar * dr[k];
+                forces[j][k] += lj_force_scalar * dr[k];
+            }
+        }
+    }
+
+    ForceResult {
+        forces,
+        potential_energy,
+    }
+}
+
 pub fn compute_forces_with_pme(
     topology: &Topology,
     cutoff: f64,
@@ -273,6 +316,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         top.atoms.push(AtomRecord {
             element: "C".into(),
@@ -284,6 +328,7 @@ mod tests {
             position: [0.18, 0.0, 0.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         top.bonds.push(BondTerm {
             i: 0,
@@ -309,6 +354,7 @@ mod tests {
                 position: [i as f64 * 0.15, 0.0, 0.0],
                 residue_id: 0,
                 molecule_id: 0,
+                born_r: None,
             });
         }
         top.dihedrals.push(DihedralTerm {

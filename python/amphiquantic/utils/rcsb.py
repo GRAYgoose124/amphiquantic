@@ -1,13 +1,7 @@
-import requests
+"""Legacy RCSB helpers — prefer amphiquantic.structure."""
 
-def fetch_pdb(pdb_id: str) -> str:
-    """ Legacy RCSB API """
-    url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-    return requests.get(url).text
+from amphiquantic.structure import fetch_pdb, normalize_pdb_id, save_structure
 
 
 def save_pdb(pdb_id: str, parent_path: str) -> None:
-    """ Legacy RCSB API """
-    file_path = f"{parent_path}/{pdb_id}.pdb"
-    with open(file_path, "w") as f:
-        f.write(fetch_pdb(pdb_id))
+    save_structure(normalize_pdb_id(pdb_id), parent_path, formats=("pdb",))

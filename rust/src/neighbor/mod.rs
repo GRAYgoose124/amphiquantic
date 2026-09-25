@@ -190,6 +190,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         top.atoms.push(AtomRecord {
             element: "C".into(),
@@ -201,6 +202,7 @@ mod tests {
             position: [0.2, 0.0, 0.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         let nl = build_neighbor_list(&top, 1.0);
         assert_eq!(nl.pairs.len(), 1);
@@ -226,6 +228,7 @@ mod tests {
                 position: [i as f64 * 0.5, 0.0, 0.0],
                 residue_id: 0,
                 molecule_id: 0,
+                born_r: None,
             });
         }
         let nl = build_neighbor_list(&top, 1.5);

@@ -35,9 +35,16 @@ def prepare_ligand(smiles_or_file: str, out_pdbqt: Path) -> Path:
     """Prepare ligand PDBQT via RDKit + Meeko when available."""
     try:
         from rdkit import Chem
+    except ImportError as exc:
+        raise ImportError(
+            "RDKit required for ligand prep (uv sync --extra docking)"
+        ) from exc
+    try:
         from meeko import MoleculePreparation, PDBQTWriterLegacy
     except ImportError as exc:
-        raise ImportError("Install docking extras: uv sync --extra docking") from exc
+        raise ImportError(
+            "Meeko required for ligand prep (uv sync --extra docking; needs scipy)"
+        ) from exc
 
     src = Path(smiles_or_file)
     if src.exists() and src.suffix.lower() in {".sdf", ".mol", ".mol2"}:
@@ -49,9 +56,14 @@ def prepare_ligand(smiles_or_file: str, out_pdbqt: Path) -> Path:
     if mol is None:
         raise ValueError(f"Could not parse ligand: {smiles_or_file}")
     mol = Chem.AddHs(mol)
+    if mol.GetNumConformers() == 0:
+        from rdkit.Chem import AllChem
+
+        if AllChem.EmbedMolecule(mol, AllChem.ETKDG()) != 0:
+            raise RuntimeError(f"RDKit 3D embed failed for ligand: {smiles_or_file}")
     prep = MoleculePreparation()
     setups = prep.prepare(mol)
-    pdbqt_string = PDBQTWriterLegacy.write_string(setups[0])
+    pdbqt_string, *_ = PDBQTWriterLegacy.write_string(setups[0])
     out_pdbqt.write_text(pdbqt_string)
     return out_pdbqt
 
@@ -104,6 +116,7 @@ def dock_ligand(
     output: str | Path,
     box_center: tuple[float, float, float] | None = None,
     box_size: tuple[float, float, float] = (20.0, 20.0, 20.0),
+    reference_ligand: str | Path | None = None,
 ) -> Path:
     """End-to-end ligand docking; writes poses SDF/PDBQT to output."""
     receptor_pdb = Path(receptor_pdb)
@@ -126,6 +139,13 @@ def dock_ligand(
         except Exception:
             rec_pdbqt.write_text(rec_fixed.read_text())
 
-        center = box_center or (0.0, 0.0, 0.0)
+        from amphiquantic.docking.binding_site import auto_docking_box
+
+        if box_center is None:
+            box = auto_docking_box(receptor_pdb, reference_ligand=reference_ligand)
+            center = box["center"]  # type: ignore[assignment]
+            box_size = box["size"]  # type: ignore[assignment]
+        else:
+            center = box_center
         dock_vina(rec_pdbqt, lig_pdbqt, center, box_size, output)
     return output

@@ -1,4 +1,5 @@
 pub mod ewald;
+pub mod gb;
 pub mod pme;
 
 use crate::topology::Topology;

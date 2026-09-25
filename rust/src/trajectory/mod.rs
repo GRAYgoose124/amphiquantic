@@ -66,20 +66,39 @@ pub struct TrajectoryReader {
     path: String,
 }
 
+#[derive(Default, Clone, Copy)]
+struct FrameMeta {
+    natoms: usize,
+    lx: f64,
+    ly: f64,
+    lz: f64,
+    pbc: bool,
+}
+
 impl TrajectoryReader {
     pub fn new(path: impl Into<String>) -> Self {
         Self { path: path.into() }
     }
 
-    pub fn last_frame_positions(&self, topology: &Topology) -> Result<Vec<[f64; 3]>, String> {
+    fn parse_last_frame(&self) -> Result<(FrameMeta, Vec<[f64; 3]>), String> {
         let content = std::fs::read_to_string(&self.path).map_err(|e| e.to_string())?;
-        let mut positions = topology.positions();
+        let mut meta = FrameMeta::default();
+        let mut positions: Vec<[f64; 3]> = Vec::new();
         let mut in_frame = false;
-        let mut idx = 0;
         for line in content.lines() {
             if line.starts_with("FRAME ") {
                 in_frame = true;
-                idx = 0;
+                positions.clear();
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 9 {
+                    meta = FrameMeta {
+                        natoms: parts[2].parse().unwrap_or(0),
+                        lx: parts[5].parse().unwrap_or(0.0),
+                        ly: parts[6].parse().unwrap_or(0.0),
+                        lz: parts[7].parse().unwrap_or(0.0),
+                        pbc: parts[8] != "0",
+                    };
+                }
                 continue;
             }
             if !in_frame || line.starts_with('#') {
@@ -89,11 +108,60 @@ impl TrajectoryReader {
                 .split_whitespace()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            if parts.len() >= 3 && idx < positions.len() {
-                positions[idx] = [parts[0], parts[1], parts[2]];
-                idx += 1;
+            if parts.len() >= 3 {
+                positions.push([parts[0], parts[1], parts[2]]);
             }
         }
+        if positions.is_empty() {
+            return Err(format!("No frames found in trajectory: {}", self.path));
+        }
+        Ok((meta, positions))
+    }
+
+    pub fn last_frame_positions(&self, topology: &Topology) -> Result<Vec<[f64; 3]>, String> {
+        let (meta, positions) = self.parse_last_frame()?;
+        if meta.natoms > 0 && meta.natoms != topology.atoms.len() {
+            return Err(format!(
+                "Trajectory natoms {} != topology {}",
+                meta.natoms,
+                topology.atoms.len()
+            ));
+        }
+        if positions.len() != topology.atoms.len() {
+            return Err(format!(
+                "Trajectory frame has {} coords, topology has {}",
+                positions.len(),
+                topology.atoms.len()
+            ));
+        }
         Ok(positions)
+    }
+
+    pub fn apply_last_frame(&self, topology: &mut Topology) -> Result<(), String> {
+        let (meta, positions) = self.parse_last_frame()?;
+        if meta.natoms > 0 && meta.natoms != topology.atoms.len() {
+            return Err(format!(
+                "Restart natoms {} != topology {}",
+                meta.natoms,
+                topology.atoms.len()
+            ));
+        }
+        if positions.len() != topology.atoms.len() {
+            return Err(format!(
+                "Restart frame has {} coords, topology has {}",
+                positions.len(),
+                topology.atoms.len()
+            ));
+        }
+        for (atom, pos) in topology.atoms.iter_mut().zip(positions) {
+            atom.position = pos;
+        }
+        if meta.lx > 0.0 {
+            topology.box_.lx = meta.lx;
+            topology.box_.ly = meta.ly;
+            topology.box_.lz = meta.lz;
+            topology.box_.pbc = meta.pbc;
+        }
+        Ok(())
     }
 }

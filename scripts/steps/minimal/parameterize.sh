@@ -1,11 +1,10 @@
-# make simple pdb file
-echo """
-ATOM      1  N   ALA A   1      64.000  64.000  64.000  1.00  0.00           N
-ATOM      2  CA  ALA A   1      63.000  63.000  63.000  1.00  0.00           C
-ATOM      3  C   ALA A   1      62.000  62.000  62.000  1.00  0.00           C
-ATOM      4  O   ALA A   1      61.000  61.000  61.000  1.00  0.00           O
-""" > /tmp/simple.pdb
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "$(dirname "$0")/_env.sh"
 
-./bin/parameterize "N[C@@H](C)C(=O)O" --from-smiles -o /tmp/simple.aqtop || ./bin/param_pdb /tmp/simple.pdb
+PDB="${1:-tests/fixtures/ala.pdb}"
+AQTOP="${2:-/tmp/simple.aqtop}"
 
-rm -f /tmp/simple.pdb /tmp/simple.aqtop
+amphi_bin parameterize "$PDB" -o "$AQTOP" --bootstrap
+export AMPHI_AQTOP="$AQTOP"

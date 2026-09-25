@@ -1,0 +1,43 @@
+applications:
+  A1:
+    id: water_box
+    tier: tier_a
+    category: fundamentals
+    fixture: water_box/solvated.aqtop
+    criteria:
+      density_g_cm3: [0.85, 1.15]
+  A3:
+    id: ethanol_solv
+    tier: tier_a
+    category: small_organic
+    fixture: ethanol_solv/ethanol_solv.aqtop
+    criteria:
+      min_atoms: 10
+      max_net_charge: 0.5
+  A4:
+    id: ala_dipeptide
+    tier: tier_a
+    category: peptide
+    fixture: ala_dipeptide/ala_dipeptide_solv.aqtop
+    criteria:
+      max_net_charge: 0.5
+  A2:
+    id: nacl_aq
+    tier: tier_b
+    category: fundamentals
+    fixture: nacl_aq/ionized.aqtop
+  A5:
+    id: crambin
+    tier: tier_b
+    category: small_protein
+    pdb_id: 1CRN
+  A6:
+    id: complex_lite
+    tier: tier_b
+    category: biomolecular
+  A8:
+    id: protein_ligand_implicit
+    tier: tier_b
+    category: biomolecular
+    protocol: protein_ligand_implicit
+    solvation: gb_obc2

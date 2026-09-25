@@ -21,6 +21,16 @@ def test_bin_scripts_exist(repo_root: Path):
         "equilibrate",
         "simulate",
         "plot_pdb",
+        "fetch_structure",
+        "fetch_ligand",
+        "build_complex",
+        "dock_ligand",
+        "new_experiment",
+        "run_experiment",
+        "prepare_implicit",
+        "prepare_receptor",
+        "render_traj",
+        "render_structure",
     ):
         path = repo_root / "bin" / name
         assert path.is_file(), f"missing bin/{name}"

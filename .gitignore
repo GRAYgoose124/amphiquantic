@@ -5,3 +5,6 @@
 .venv
 target/*
 .cursor/
+experiments/
+output/
+*.mdp

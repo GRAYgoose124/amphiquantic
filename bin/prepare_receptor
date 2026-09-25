@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Strip ligands/waters from holo PDB to apo receptor."""
+
+import argparse
+from pathlib import Path
+
+from amphiquantic.structure.prepare_receptor import prepare_apo_file, protonate_pdb_file
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Prepare apo receptor PDB")
+    p.add_argument("input", type=str, help="Holo receptor PDB")
+    p.add_argument("-o", "--output", type=str, required=True, help="Apo output PDB")
+    p.add_argument("--keep-het", action="store_true", help="Keep HETATM records")
+    p.add_argument(
+        "--protonate",
+        action="store_true",
+        help="Add missing atoms/hydrogens via PDBFixer (needs --extra protein)",
+    )
+    p.add_argument("--ph", type=float, default=7.0, help="pH for protonation")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    out = prepare_apo_file(
+        args.input,
+        args.output,
+        drop_het=not args.keep_het,
+        drop_water=True,
+        protonate=args.protonate,
+        ph=args.ph,
+    )
+    print(f"Wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

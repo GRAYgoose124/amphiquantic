@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Resolve ligand SMILES from PubChem or extract from RCSB PDB."""
+
+import argparse
+from pathlib import Path
+
+from amphiquantic.ligand import extract_hetatm_residue, resolve_ligand_query, save_ligand_smiles
+from amphiquantic.structure import fetch_pdb, normalize_pdb_id
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Fetch ligand SMILES or PDB HETATM block")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--query", "-q", help="PubChem name, CID, or literal SMILES")
+    g.add_argument(
+        "--from-pdb",
+        metavar="PDB_ID:RESNAME",
+        help="Extract HETATM from RCSB structure (e.g. 1HTM:HEM)",
+    )
+    p.add_argument("-o", "--output", type=str, required=True, help="Output .smi or .pdb")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    out = Path(args.output)
+
+    if args.from_pdb:
+        pdb_id, resname = args.from_pdb.split(":", 1)
+        code = normalize_pdb_id(pdb_id)
+        pdb_text = fetch_pdb(code)
+        het = extract_hetatm_residue(pdb_text, resname)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(het)
+        print(f"Wrote HETATM block for {resname} from {code} -> {out}")
+        return
+
+    smiles, source = resolve_ligand_query(args.query)
+    save_ligand_smiles(smiles, out)
+    print(f"Wrote SMILES ({source}) -> {out}")
+
+
+if __name__ == "__main__":
+    main()

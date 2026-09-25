@@ -32,7 +32,7 @@ echo "==> maturin develop"
 uv run maturin develop --manifest-path rust/Cargo.toml
 
 echo "==> cargo test"
-(cd rust && cargo test)
+(cd rust && PYO3_PYTHON="$ROOT/.venv/bin/python" cargo test)
 
 MARKER_EXPR="tier_a"
 if [[ "$FAST" -eq 1 ]]; then

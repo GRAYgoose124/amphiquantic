@@ -125,6 +125,7 @@ mod tests {
             position: [0.5, 0.5, 0.5],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         top.atoms.push(AtomRecord {
             element: "Cl".into(),
@@ -136,6 +137,7 @@ mod tests {
             position: [2.0, 2.0, 2.0],
             residue_id: 0,
             molecule_id: 0,
+            born_r: None,
         });
         let ctx = PmeContext::new(&top, 1.0);
         let r = compute_pme_forces(&top, &ctx);

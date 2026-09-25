@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 from amphiquantic.topology.io import load_topology, save_topology
+
+
+def _angstrom_to_nm(coord: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (coord[0] / 10.0, coord[1] / 10.0, coord[2] / 10.0)
 
 
 def _parse_pdbqt_coords(path: Path) -> list[tuple[float, float, float]]:
@@ -36,11 +39,52 @@ def _parse_sdf_coords(path: Path) -> list[tuple[float, float, float]]:
     return coords
 
 
-def parse_pose_coords(pose_path: str | Path) -> list[tuple[float, float, float]]:
+def _coords_from_pdbqt_meeko(path: Path, n_atoms: int) -> list[tuple[float, float, float]]:
+    """Expand a Vina/Meeko PDBQT pose to full-atom coordinates via Meeko."""
+    try:
+        from meeko import PDBQTMolecule, RDKitMolCreate
+    except ImportError as exc:
+        raise ImportError(
+            "Meeko required to map PDBQT poses onto all-atom topologies "
+            "(uv sync --extra docking)"
+        ) from exc
+
+    pdbqt_mol = PDBQTMolecule.from_file(str(path))
+    mols = RDKitMolCreate.from_pdbqt_mol(pdbqt_mol)
+    if not mols:
+        raise ValueError(f"No molecules parsed from PDBQT: {path}")
+    mol = mols[0]
+    if mol.GetNumAtoms() != n_atoms:
+        raise ValueError(
+            f"PDBQT expanded to {mol.GetNumAtoms()} atoms but topology has {n_atoms}"
+        )
+    if mol.GetNumConformers() == 0:
+        raise ValueError(f"PDBQT molecule has no conformer: {path}")
+    conf = mol.GetConformer()
+    return [
+        _angstrom_to_nm(
+            (
+                conf.GetAtomPosition(i).x,
+                conf.GetAtomPosition(i).y,
+                conf.GetAtomPosition(i).z,
+            )
+        )
+        for i in range(mol.GetNumAtoms())
+    ]
+
+
+def parse_pose_coords(
+    pose_path: str | Path,
+    *,
+    n_atoms: int | None = None,
+) -> list[tuple[float, float, float]]:
     path = Path(pose_path)
     suffix = path.suffix.lower()
     if suffix == ".pdbqt":
-        return _parse_pdbqt_coords(path)
+        coords = _parse_pdbqt_coords(path)
+        if n_atoms is not None and len(coords) != n_atoms:
+            return _coords_from_pdbqt_meeko(path, n_atoms)
+        return [_angstrom_to_nm(c) for c in coords]
     if suffix in {".sdf", ".mol"}:
         return _parse_sdf_coords(path)
     if suffix == ".pdb":
@@ -48,7 +92,11 @@ def parse_pose_coords(pose_path: str | Path) -> list[tuple[float, float, float]]
         for line in path.read_text().splitlines():
             if line.startswith(("ATOM", "HETATM")):
                 coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
-        return coords
+        if n_atoms is not None and len(coords) != n_atoms:
+            raise ValueError(
+                f"Pose has {len(coords)} atoms but topology has {n_atoms}"
+            )
+        return [_angstrom_to_nm(c) for c in coords]
     raise ValueError(f"Unsupported pose format: {path}")
 
 
@@ -77,7 +125,7 @@ def pose_to_topology(
     output: str | Path,
 ) -> dict[str, Any]:
     top = load_topology(ligand_aqtop)
-    coords = parse_pose_coords(pose_path)
+    coords = parse_pose_coords(pose_path, n_atoms=len(top["atoms"]))
     updated = apply_pose_to_topology(top, coords)
     save_topology(output, updated)
     return updated

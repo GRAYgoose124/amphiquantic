@@ -17,11 +17,13 @@ mod utilities;
 
 use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, run_md, AtomPipelineParams};
-use integrator::{langevin_step, velocity_verlet_step, MdState};
+use integrator::{langevin_step, velocity_verlet_step, MdState, Restraint};
 use minimize::minimize;
+use forces::{backend_from_env, compute_forces};
+use electrostatics::ewald_energy_correction;
 use pdb::PdbFilePy;
 use topology::{Topology, TopologyPy};
-use trajectory::TrajectoryWriter;
+use trajectory::{TrajectoryReader, TrajectoryWriter};
 
 #[pyfunction]
 fn load_topology(path: &str) -> PyResult<TopologyPy> {
@@ -38,6 +40,14 @@ fn ionize_topology(path: &str, output: Option<&str>) -> PyResult<TopologyPy> {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     }
     Ok(TopologyPy { inner: top })
+}
+
+#[pyfunction]
+fn topology_energy(path: &str) -> PyResult<f64> {
+    let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    let backend = backend_from_env();
+    let result = compute_forces(&top, 1.0, backend);
+    Ok(result.potential_energy + ewald_energy_correction(&top))
 }
 
 #[pyfunction]
@@ -72,17 +82,36 @@ fn minimize_topology(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None))]
+#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None, restart_traj=None, restraint_k=None))]
 fn equilibrate_topology(
     path: &str,
     output_traj: Option<&str>,
     steps: Option<u64>,
     temperature: Option<f64>,
+    restart_traj: Option<&str>,
+    restraint_k: Option<f64>,
 ) -> PyResult<TopologyPy> {
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
+    if let Some(restart) = restart_traj {
+        TrajectoryReader::new(restart)
+            .apply_last_frame(&mut top)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    }
     let n_steps = steps.unwrap_or(100);
     let temp = temperature.unwrap_or(300.0);
     let mut state = MdState::new(top.clone(), temp);
+    if let Some(k) = restraint_k {
+        if k > 0.0 {
+            for (atom, pos) in reference.iter().enumerate() {
+                state.restraints.push(Restraint {
+                    atom,
+                    k,
+                    position: *pos,
+                });
+            }
+        }
+    }
     let mut writer = output_traj.map(TrajectoryWriter::new);
     for step in 0..n_steps {
         let res = langevin_step(&mut state, 1.0);
@@ -96,19 +125,26 @@ fn equilibrate_topology(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None))]
+#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None, restart_traj=None, npt=None))]
 fn simulate_topology(
     path: &str,
     output_traj: Option<&str>,
     steps: Option<u64>,
     temperature: Option<f64>,
+    restart_traj: Option<&str>,
+    npt: Option<bool>,
 ) -> PyResult<TopologyPy> {
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    if let Some(restart) = restart_traj {
+        TrajectoryReader::new(restart)
+            .apply_last_frame(&mut top)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    }
     let n_steps = steps.unwrap_or(100);
     let temp = temperature.unwrap_or(300.0);
     let mut state = MdState::new(top.clone(), temp);
     state.use_constraints = true;
-    state.npt = false;
+    state.npt = npt.unwrap_or(false);
     let mut writer = output_traj.map(TrajectoryWriter::new);
     for step in 0..n_steps {
         let res = velocity_verlet_step(&mut state, 1.0);
@@ -186,6 +222,7 @@ fn simulate(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
 fn rustquantic(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PdbFilePy>()?;
     m.add_class::<TopologyPy>()?;
+    m.add_function(wrap_pyfunction_bound!(topology_energy, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(ionize_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(load_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(minimize_topology, &m)?)?;

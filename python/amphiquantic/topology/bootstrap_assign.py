@@ -62,12 +62,67 @@ def parameterize_from_pdb_bootstrap(pdb_path: str | Path, output: str | Path) ->
 
 
 def parameterize_from_smiles_bootstrap(smiles: str, output: str | Path) -> dict[str, Any]:
+    """Bootstrap SMILES via OpenFF when available, else RDKit 3D embed + element tables."""
+    src = Path(smiles)
+    if src.is_file():
+        smiles = src.read_text().strip()
     try:
         from amphiquantic.topology.openff_assign import parameterize_from_smiles
 
         return parameterize_from_smiles(smiles, output)
     except ImportError:
+        pass
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+    except ImportError as exc:
         raise RuntimeError(
-            "OpenFF Toolkit not installed; SMILES parameterization requires "
-            "openff-toolkit from conda-forge or git."
-        ) from None
+            "SMILES bootstrap requires openff-toolkit or rdkit (uv sync --extra docking)"
+        ) from exc
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    mol = Chem.AddHs(mol)
+    if AllChem.EmbedMolecule(mol, AllChem.ETKDG()) != 0:
+        raise RuntimeError(f"RDKit embed failed for SMILES: {smiles}")
+
+    conf = mol.GetConformer()
+    atoms = []
+    for idx in range(mol.GetNumAtoms()):
+        atom = mol.GetAtomWithIdx(idx)
+        elem = atom.GetSymbol()
+        pos = conf.GetAtomPosition(idx)
+        sigma, epsilon = _lj(elem)
+        atoms.append(
+            {
+                "element": elem,
+                "name": f"{elem}{idx + 1}",
+                "mass": DEFAULT_MASSES.get(elem, 1.0),
+                "charge": 0.0,
+                "sigma": sigma,
+                "epsilon": epsilon,
+                "position": [pos.x / 10.0, pos.y / 10.0, pos.z / 10.0],
+                "residue_id": 0,
+                "molecule_id": 0,
+            }
+        )
+    bond_terms = []
+    exclusions = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bond_terms.append({"i": i, "j": j, "k": 500.0, "r0": 0.15})
+        exclusions.extend([[i, j], [j, i]])
+    top = {
+        "version": AQTOP_VERSION,
+        "metadata": {"openff_version": "bootstrap-rdkit", "source": smiles, "smiles": smiles},
+        "box": {"lx": 0.0, "ly": 0.0, "lz": 0.0, "pbc": False},
+        "atoms": atoms,
+        "bonds": bond_terms,
+        "angles": [],
+        "dihedrals": [],
+        "exclusions": exclusions,
+    }
+    save_topology(output, top)
+    return top

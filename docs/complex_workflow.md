@@ -1,8 +1,31 @@
 # Enzymatic complex workflow
 
-End-to-end recipe for enzyme + ligand (+ optional second chain) in explicit solvent.
+End-to-end recipe for enzyme + ligand. **Implicit-first (OBC-II GB)** via experiments; explicit TIP3P remains for refinement.
 
-## Prerequisites
+## Experiment-based pipeline (recommended)
+
+```bash
+uv sync --extra docking
+uv run maturin develop --manifest-path rust/Cargo.toml
+
+uv run python bin/new_experiment \
+  --protocol protein_ligand_implicit \
+  --receptor receptor.pdb \
+  --ligand 'CCO'
+
+uv run python bin/run_experiment experiments/<uuid>
+```
+
+Outputs land in `experiments/<uuid>/outputs/{datestamp}/` including topology, trajectory, docking poses, and `render/movie.mp4`. See [experiments.md](experiments.md).
+
+## Implicit vs explicit
+
+| Path | Template | Solvation |
+|------|----------|-----------|
+| Fast (default) | `protein_ligand_implicit` | Rust OBC-II GB — no water box |
+| Refinement | `protein_ligand_explicit` | TIP3P + PME via `build.sh` |
+
+## Legacy explicit workflow
 
 ```bash
 uv sync --extra openff --extra protein --extra docking

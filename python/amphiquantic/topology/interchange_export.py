@@ -11,6 +11,29 @@ KJ_PER_MOL = 1.0
 NM_TO_ANGSTROM = 10.0
 
 
+def bond_length_angstrom(offmol, bond) -> float:
+    """Bond length in angstrom from the first conformer (OpenFF 0.18+ compatible)."""
+    if offmol.n_conformers == 0:
+        offmol.generate_conformers(n_conformers=1)
+    conf = offmol.conformers[0]
+    i, j = bond.atom1_index, bond.atom2_index
+    x1, y1, z1 = conf[i].m_as("angstrom")
+    x2, y2, z2 = conf[j].m_as("angstrom")
+    return math.hypot(x1 - x2, y1 - y2, z1 - z2)
+
+
+def _assign_partial_charges(offmol) -> None:
+    if offmol.n_conformers == 0:
+        offmol.generate_conformers(n_conformers=1)
+    try:
+        offmol.assign_partial_charges(
+            partial_charge_method="am1bcc",
+            normalize_partial_charges=True,
+        )
+    except (ValueError, AttributeError):
+        offmol.assign_partial_charges(partial_charge_method="gasteiger")
+
+
 def _build_exclusions(
     bonds: list[dict], angles: list[dict], dihedrals: list[dict]
 ) -> list[list[int]]:
@@ -91,7 +114,7 @@ def interchange_to_aqtop(
     except (KeyError, AttributeError, IndexError):
         for bond in offmol.bonds:
             i, j = bond.atom1_index, bond.atom2_index
-            length = offmol.get_bond_length(bond).m_as("nanometer") * NM_TO_ANGSTROM
+            length = bond_length_angstrom(offmol, bond)
             bonds.append({"i": i, "j": j, "k": 500.0, "r0": float(length)})
 
     try:
@@ -183,7 +206,7 @@ def create_interchange(offmol, ff_name: str):
     from openff.toolkit import ForceField
 
     ff = ForceField(ff_name)
-    offmol.assign_partial_charges(partial_charge_method="am1bcc", normalize_partial_charges=True)
+    _assign_partial_charges(offmol)
     if offmol.n_conformers == 0:
         offmol.generate_conformers(n_conformers=1)
     return Interchange.from_smirnoff(force_field=ff, topology=[offmol]), ff

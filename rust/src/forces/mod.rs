@@ -14,6 +14,19 @@ pub enum ForceBackend {
 }
 
 pub fn compute_forces(topology: &Topology, cutoff: f64, backend: ForceBackend) -> CpuForceResult {
+    if topology.is_implicit_gb() {
+        let bonded = cpu::compute_bonded_forces(topology);
+        let lj = cpu::compute_lj_forces(topology, cutoff);
+        let gb = crate::electrostatics::gb::compute_gb_forces(topology);
+        let mut result = cpu::merge_force_results(bonded, lj);
+        for (f, fg) in result.forces.iter_mut().zip(gb.forces.iter()) {
+            f[0] += fg[0];
+            f[1] += fg[1];
+            f[2] += fg[2];
+        }
+        result.potential_energy += gb.potential_energy;
+        return result;
+    }
     match backend {
         ForceBackend::Cpu => {
             if topology.box_.pbc {

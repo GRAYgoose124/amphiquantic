@@ -31,16 +31,22 @@ def solvate_topology(
     """Add TIP3P waters on a grid; set orthorhombic PBC box."""
     atoms = topology["atoms"]
     if not atoms:
-        return topology
-
-    x0, x1, y0, y1, z0, z1 = _solute_bounds(atoms, padding)
-    lx = x1 - x0
-    ly = y1 - y0
-    lz = z1 - z0
+        lx = ly = lz = 2.4
+        x0, x1 = 0.0, lx
+        y0, y1 = 0.0, ly
+        z0, z1 = 0.0, lz
+        solute_positions: list[list[float]] = []
+        if spacing > 0.35:
+            spacing = 0.31
+    else:
+        x0, x1, y0, y1, z0, z1 = _solute_bounds(atoms, padding)
+        lx = x1 - x0
+        ly = y1 - y0
+        lz = z1 - z0
+        solute_positions = [a["position"] for a in atoms]
 
     waters: list[dict[str, Any]] = []
-    mol_id = max((a.get("molecule_id", 0) for a in atoms), default=0) + 1
-    solute_positions = [a["position"] for a in atoms]
+    mol_id = max((a.get("molecule_id", 0) for a in atoms), default=-1) + 1
 
     x = x0
     while x < x1:
@@ -59,12 +65,15 @@ def solvate_topology(
             y += spacing
         x += spacing
 
-    if not waters:
+    if not waters and atoms:
+        if spacing > 0.15:
+            return solvate_topology(topology, padding=padding, spacing=spacing * 0.5)
         out = dict(topology)
         out["box"] = {"lx": lx, "ly": ly, "lz": lz, "pbc": True}
         return out
 
-    merged = merge_topologies([topology] + waters)
+    bases = ([topology] if atoms else []) + waters
+    merged = merge_topologies(bases) if len(bases) > 1 else merge_topologies(waters)
     merged["box"] = {"lx": lx, "ly": ly, "lz": lz, "pbc": True}
     merged["metadata"] = dict(merged.get("metadata", {}))
     merged["metadata"]["solvent"] = "TIP3P"

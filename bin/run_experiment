@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Execute an experiment protocol (creates outputs/{datestamp}/)."""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+from amphiquantic.experiment.layout import resolve_experiment_root
+
+_IMPLICIT_PROTOCOLS = frozenset(
+    {"protein_ligand_implicit", "enzyme_complex_implicit"},
+)
+_EXPLICIT_PROTOCOLS = frozenset({"protein_ligand_explicit"})
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Run experiment protocol.sh")
+    p.add_argument("experiment", type=str, help="Path to experiments/{uuid}/")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    root = resolve_experiment_root(args.experiment)
+    protocol = root / "protocol.sh"
+    if not protocol.is_file():
+        print(f"Missing protocol.sh in {root}", file=sys.stderr)
+        sys.exit(1)
+    env = os.environ.copy()
+    manifest_path = root / "manifest.yaml"
+    if manifest_path.is_file():
+        manifest = yaml.safe_load(manifest_path.read_text())
+        protocol_name = manifest.get("protocol_name", "")
+        if protocol_name in _IMPLICIT_PROTOCOLS:
+            env.setdefault("AMPHI_UV_EXTRAS", "docking")
+        elif protocol_name in _EXPLICIT_PROTOCOLS:
+            env.setdefault("AMPHI_UV_EXTRAS", "docking,openff,protein")
+    proc = subprocess.run(["bash", str(protocol)], cwd=root, env=env)
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()

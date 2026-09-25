@@ -87,7 +87,9 @@ pub fn initialize_velocities(topology: &Topology, temperature: f64) -> Vec<[f64;
 
 fn compute_step_forces(state: &mut MdState, cutoff: f64) -> crate::forces::cpu::ForceResult {
     state.neighbor_manager.maybe_rebuild(&state.topology, cutoff);
-    let use_pme = state.topology.box_.pbc && state.step_count % 2 == 0;
+    let use_pme = state.topology.box_.pbc
+        && !state.topology.is_implicit_gb()
+        && state.step_count % 2 == 0;
     let backend = backend_from_env();
     let mut result = match backend {
         ForceBackend::Hybrid => {

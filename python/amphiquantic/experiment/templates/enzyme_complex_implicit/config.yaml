@@ -1,0 +1,12 @@
+solvation_model: gb_obc2
+dielectric: 78.5
+steps:
+  minimize: 50
+  equilibrate: 100
+  simulate: 200
+require_dock: true
+inputs:
+  receptor: inputs/receptor.pdb
+  ligand: inputs/ligand.smi
+  cofactor: null
+  chain_b: null

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Render .aqtrj trajectory to PNG frames and optional MP4."""
+
+import argparse
+import sys
+
+from amphiquantic.visualization.traj_render import render_trajectory
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Render trajectory to MP4 or PNG frames")
+    p.add_argument("trajectory", type=str, help=".aqtrj file")
+    p.add_argument("topology", type=str, nargs="?", default=None, help=".aqtop (optional)")
+    p.add_argument("-o", "--output", type=str, default=None)
+    p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--fps", type=int, default=24)
+    p.add_argument(
+        "--solute-only",
+        action="store_true",
+        help="Render receptor+ligand only (exclude solvent)",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    out = render_trajectory(
+        args.trajectory,
+        args.topology,
+        args.output,
+        stride=args.stride,
+        fps=args.fps,
+        solute_only=args.solute_only,
+    )
+    if out is None:
+        print("No frames rendered", file=sys.stderr)
+        sys.exit(1)
+    print(f"Wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

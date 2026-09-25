@@ -10,6 +10,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Minimize a structure using wgpu forces")
     parser.add_argument("input", type=str, help="PDB or .aqtop")
     parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--steps", type=int, default=100, help="Max minimization steps")
+    parser.add_argument("--step-size", type=float, default=0.001, help="Step size (nm)")
     parser.add_argument("--plot", action="store_true", help="Show matplotlib plot")
     return parser.parse_args()
 
@@ -20,7 +22,9 @@ if __name__ == "__main__":
 
     if path.suffix == ".aqtop":
         out = args.output or str(path.with_suffix(".min.aqtop"))
-        top, energy, iters = minimize_topology(str(path), out)
+        top, energy, iters = minimize_topology(
+            str(path), out, args.steps, args.step_size
+        )
         coords, atom_types, bonds = top.to_pdb_types()
         print(f"Minimized in {iters} steps, E={energy:.4f} kJ/mol")
     else:

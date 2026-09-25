@@ -1,0 +1,16 @@
+solvation_model: tip3p
+pdb_id: 1FKF
+ligand_resname: FK5
+parameterization:
+  receptor: protein_ff
+  ligand: openff
+steps:
+  minimize: 1000
+  equilibrate: 10000
+  simulate: 500000
+require_dock: true
+inputs:
+  receptor: inputs/receptor.pdb
+  receptor_apo: inputs/receptor_apo.pdb
+  reference_ligand: inputs/reference_ligand.pdb
+  ligand: inputs/ligand.smi
