@@ -6,7 +6,7 @@ from rustquantic import simulate_topology
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Production MD simulation")
+    parser = argparse.ArgumentParser(description="Production MD simulation with configurable ensemble control")
     parser.add_argument("input", type=str, help=".aqtop topology")
     parser.add_argument("-o", "--output", type=str, default=None)
     parser.add_argument("--trajectory", type=str, default=None)
@@ -15,13 +15,63 @@ def parse_args():
     parser.add_argument(
         "--npt",
         action="store_true",
-        help="Enable NPT barostat (experimental)",
+        help="Enable NPT barostat (defaults to Berendsen unless --barostat is given)",
     )
     parser.add_argument(
         "--restart",
         type=str,
         default=None,
         help="Restart coordinates from .aqtrj last frame",
+    )
+    parser.add_argument(
+        "--thermostat",
+        type=str,
+        default="none",
+        choices=["none", "langevin", "berendsen", "vrescale", "nose-hoover"],
+        help="Thermostat algorithm (default: none / NVE)",
+    )
+    parser.add_argument(
+        "--barostat",
+        type=str,
+        default=None,
+        choices=["none", "berendsen", "montecarlo"],
+        help="Barostat algorithm; also enables NPT when set",
+    )
+    parser.add_argument(
+        "--pressure",
+        type=float,
+        default=1.0,
+        help="Target pressure in bar for the barostat (default: 1.0)",
+    )
+    parser.add_argument(
+        "--tau-t",
+        type=float,
+        default=None,
+        help="Thermostat coupling time constant (ps)",
+    )
+    parser.add_argument(
+        "--tau-p",
+        type=float,
+        default=None,
+        help="Barostat coupling time constant (ps)",
+    )
+    parser.add_argument(
+        "--com-remove-interval",
+        type=int,
+        default=None,
+        help="Steps between center-of-mass motion removal (0 disables periodic removal)",
+    )
+    parser.add_argument(
+        "--nh-chain-length",
+        type=int,
+        default=3,
+        help="Nose-Hoover chain length (default: 3)",
+    )
+    parser.add_argument(
+        "--mc-interval",
+        type=int,
+        default=None,
+        help="Steps between Monte Carlo barostat attempts",
     )
     return parser.parse_args()
 
@@ -30,14 +80,25 @@ if __name__ == "__main__":
     args = parse_args()
     path = Path(args.input)
     traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
-    top = simulate_topology(
+    top, final_temperature, final_pressure = simulate_topology(
         str(path),
         traj,
         args.steps,
         args.temperature,
         args.restart,
         args.npt,
+        args.thermostat,
+        args.barostat,
+        args.pressure,
+        args.tau_t,
+        args.tau_p,
+        args.com_remove_interval,
+        args.nh_chain_length,
+        args.mc_interval,
     )
     out = args.output or str(path.with_suffix(".md.aqtop"))
     top.write(out)
-    print(f"Simulated → {out}, trajectory {traj}")
+    print(
+        f"Simulated → {out}, trajectory {traj} "
+        f"(final T={final_temperature:.1f} K, P={final_pressure:.1f} bar)"
+    )

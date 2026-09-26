@@ -22,7 +22,9 @@ def test_simulate_restart_from_trajectory(tmp_path, built_extension, force_backe
     before = load_topology(str(top_path)).to_pdb_types()[0]
     traj = tmp_path / "eq.aqtrj"
     equilibrate_topology(str(top_path), str(traj), 5, 300.0, None, None)
-    out_top = simulate_topology(str(top_path), str(tmp_path / "md.aqtrj"), 3, 300.0, str(traj), False)
+    out_top, _final_temp, _final_pressure = simulate_topology(
+        str(top_path), str(tmp_path / "md.aqtrj"), 3, 300.0, str(traj), False
+    )
     after = out_top.to_pdb_types()[0]
     assert after != before
 
