@@ -37,15 +37,29 @@ def test_smiles_has_complete_stereo():
 @pytest.mark.tier_a
 @pytest.mark.openff
 def test_smiles_is_openff_ready():
+    # `smiles_is_openff_ready` falls back to a text-only heuristic
+    # (`smiles_has_complete_stereo`) when openff-toolkit (or a
+    # cheminformatics backend for it, e.g. RDKit) is not installed; that
+    # heuristic cannot detect an *implicit* stereocentre with no `@`/`@@`
+    # marker at all, so the case below only exercises real OpenFF-backed
+    # stereo perception and needs the optional `openff` extra
+    # (`uv sync --extra openff`) to be meaningful.
+    pytest.importorskip("openff.toolkit")
     from amphiquantic.ligand.db import smiles_is_openff_ready
 
     assert smiles_is_openff_ready("CCO")
-    # HET-derived FK506 SMILES (undefined stereo for OpenFF)
-    fk506_het = (
-        "CCC[C@@H]1CC(C)C[C@H](C)C[C@H](OC)[C@H]2O[C@@](O)(C(O)C(O)N3CCCC[C@H]3C(O)O"
-        "[C@H](C(C)C[C@@H]3CC[C@@H](O)[C@H](OC)C3)[C@H](C)[C@@H](O)CC1O)[C@H](C)C[C@@H]2OC"
-    )
-    assert not smiles_is_openff_ready(fk506_het)
+    # A chiral centre (4 distinct substituents: CH3, F, Cl, Br) with no
+    # stereo marker in the SMILES: genuinely undefined stereochemistry, so
+    # OpenFF's Molecule.from_smiles refuses it with
+    # UndefinedStereochemistryError. (Note: the SMILES formerly used here
+    # for this case, a HET-derived FK506 string, actually carries full
+    # `@`/`@@` stereo markers on every centre — real RDKit-backed OpenFF
+    # parses it fine, so it was not actually testing the undefined-stereo
+    # path; it only "worked" while this test ran without a cheminformatics
+    # toolkit installed, via the text-heuristic fallback in
+    # `smiles_is_openff_ready`.)
+    undefined_stereo_smiles = "CC(F)(Cl)Br"
+    assert not smiles_is_openff_ready(undefined_stereo_smiles)
 
 
 @pytest.mark.tier_a
