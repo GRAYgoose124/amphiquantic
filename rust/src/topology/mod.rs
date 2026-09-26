@@ -153,6 +153,45 @@ impl Topology {
         obc2_effective_born_r(rho)
     }
 
+    /// Hydrogen mass repartitioning: raise every hydrogen's mass to
+    /// `h_mass` Da, subtracting the added mass from its single bonded
+    /// heavy-atom partner. Total system mass is exactly conserved. Skips
+    /// a hydrogen whose current mass is already >= `h_mass`, or whose
+    /// heavy-atom partner cannot afford the transfer without going
+    /// non-positive (it is left unmodified in that case).
+    pub fn apply_hmr(&mut self, h_mass: f64) {
+        // Map each hydrogen to its single bonded heavy-atom partner.
+        let mut heavy_partner = vec![None; self.atoms.len()];
+        for bond in &self.bonds {
+            let (i, j) = (bond.i, bond.j);
+            let i_is_h = self.atoms[i].element == "H";
+            let j_is_h = self.atoms[j].element == "H";
+            if i_is_h && !j_is_h {
+                heavy_partner[i] = Some(j);
+            } else if j_is_h && !i_is_h {
+                heavy_partner[j] = Some(i);
+            }
+        }
+
+        for h_idx in 0..self.atoms.len() {
+            if self.atoms[h_idx].element != "H" {
+                continue;
+            }
+            let Some(heavy_idx) = heavy_partner[h_idx] else {
+                continue;
+            };
+            let delta = h_mass - self.atoms[h_idx].mass;
+            if delta <= 0.0 {
+                continue;
+            }
+            if self.atoms[heavy_idx].mass - delta <= 0.0 {
+                continue;
+            }
+            self.atoms[h_idx].mass = h_mass;
+            self.atoms[heavy_idx].mass -= delta;
+        }
+    }
+
     /// Virtual charge neutralization for implicit solvent (no ion atoms).
     pub fn neutralize_virtual(&mut self) {
         let charge = self.net_charge();

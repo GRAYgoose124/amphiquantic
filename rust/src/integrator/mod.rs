@@ -1,4 +1,7 @@
-use crate::constraints::{apply_constraints, apply_rattle, build_constraints, ConstraintSet};
+use crate::constraints::{
+    apply_constraints, apply_rattle, apply_settle_velocity, build_constraints,
+    compute_constraint_virial, ConstraintSet,
+};
 use crate::electrostatics::apply_pbc;
 use crate::forces::{backend_from_env, compute_forces, ForceBackend};
 use crate::neighbor::NeighborListManager;
@@ -164,7 +167,7 @@ impl MdState {
     pub fn num_constraints(&self) -> usize {
         self.constraints
             .as_ref()
-            .map(|c| c.shake_bonds.len())
+            .map(|c| c.shake_bonds.len() + 3 * c.waters.len())
             .unwrap_or(0)
     }
 
@@ -571,6 +574,7 @@ pub fn langevin_step(state: &mut MdState, cutoff: f64) -> MdStepResult {
     let mut rng = rand::thread_rng();
     let gamma = state.friction;
     let dt = state.timestep;
+    let reference: Vec<[f64; 3]> = state.topology.atoms.iter().map(|a| a.position).collect();
 
     for ((atom, vel), force) in state
         .topology
@@ -596,8 +600,13 @@ pub fn langevin_step(state: &mut MdState, cutoff: f64) -> MdStepResult {
 
     if state.use_constraints {
         if let Some(ref c) = state.constraints.clone() {
-            apply_constraints(&mut state.topology, c);
+            let pre_constraint: Vec<[f64; 3]> =
+                state.topology.atoms.iter().map(|a| a.position).collect();
+            apply_constraints(&mut state.topology, &reference, c);
+            apply_settle_velocity(&reference, &state.topology, &mut state.velocities, dt, c);
             apply_rattle(&state.topology, &mut state.velocities, c);
+            state.last_virial +=
+                compute_constraint_virial(&state.topology, &pre_constraint, dt, c);
         }
     }
 
@@ -614,6 +623,8 @@ pub fn langevin_step(state: &mut MdState, cutoff: f64) -> MdStepResult {
 /// Velocity-Verlet integration step with a pluggable thermostat/barostat.
 pub fn velocity_verlet_step(state: &mut MdState, cutoff: f64) -> MdStepResult {
     let forces = compute_step_forces(state, cutoff);
+    let reference: Vec<[f64; 3]> = state.topology.atoms.iter().map(|a| a.position).collect();
+    let dt = state.timestep;
 
     for ((atom, vel), force) in state
         .topology
@@ -633,13 +644,26 @@ pub fn velocity_verlet_step(state: &mut MdState, cutoff: f64) -> MdStepResult {
         }
     }
 
+    let mut pre_constraint = None;
     if state.use_constraints {
         if let Some(ref c) = state.constraints.clone() {
-            apply_constraints(&mut state.topology, c);
+            pre_constraint = Some(
+                state
+                    .topology
+                    .atoms
+                    .iter()
+                    .map(|a| a.position)
+                    .collect::<Vec<_>>(),
+            );
+            apply_constraints(&mut state.topology, &reference, c);
+            apply_settle_velocity(&reference, &state.topology, &mut state.velocities, dt, c);
         }
     }
 
     let forces2 = compute_step_forces(state, cutoff);
+    if let (Some(pre), Some(c)) = (pre_constraint, state.constraints.clone()) {
+        state.last_virial += compute_constraint_virial(&state.topology, &pre, dt, &c);
+    }
     for (vel, (atom, force)) in state
         .velocities
         .iter_mut()
@@ -738,6 +762,187 @@ mod tests {
             }
         }
         top
+    }
+
+    /// Small water + solute (CH3-capped chain) system used for the
+    /// HMR/4fs NVE energy-conservation check.
+    fn water_and_solute_topology() -> Topology {
+        let mut top = Topology::new();
+        top.box_ = SimulationBox {
+            lx: 3.0,
+            ly: 3.0,
+            lz: 3.0,
+            pbc: true,
+        };
+        let roh = 0.09572;
+        let hoh = 1.824218134_f64;
+        for w in 0..6 {
+            let base = [
+                0.3 + (w % 3) as f64 * 0.9,
+                0.3 + (w / 3) as f64 * 0.9,
+                0.5,
+            ];
+            let o_idx = top.atoms.len();
+            top.atoms.push(AtomRecord {
+                element: "O".into(),
+                name: "O".into(),
+                mass: 15.999,
+                charge: -0.834,
+                sigma: 0.315,
+                epsilon: 0.636,
+                position: base,
+                residue_id: w as u32,
+                molecule_id: w as u32,
+                born_r: None,
+            });
+            let h1 = [base[0] + roh, base[1], base[2]];
+            let h2 = [
+                base[0] + roh * hoh.cos(),
+                base[1] + roh * hoh.sin(),
+                base[2],
+            ];
+            for (name, pos) in [("H1", h1), ("H2", h2)] {
+                top.atoms.push(AtomRecord {
+                    element: "H".into(),
+                    name: name.into(),
+                    mass: 1.008,
+                    charge: 0.417,
+                    sigma: 0.0,
+                    epsilon: 0.0,
+                    position: pos,
+                    residue_id: w as u32,
+                    molecule_id: w as u32,
+                    born_r: None,
+                });
+            }
+            top.bonds.push(crate::topology::BondTerm {
+                i: o_idx,
+                j: o_idx + 1,
+                k: 5000.0,
+                r0: roh,
+            });
+            top.bonds.push(crate::topology::BondTerm {
+                i: o_idx,
+                j: o_idx + 2,
+                k: 5000.0,
+                r0: roh,
+            });
+        }
+
+        // A short solute "chain": two carbons bonded to each other, each
+        // carrying two hydrogens (LINCS-constrained C-H bonds).
+        let c1 = top.atoms.len();
+        top.atoms.push(AtomRecord {
+            element: "C".into(),
+            name: "C1".into(),
+            mass: 12.011,
+            charge: 0.0,
+            sigma: 0.34,
+            epsilon: 0.36,
+            position: [1.5, 1.5, 1.5],
+            residue_id: 100,
+            molecule_id: 100,
+            born_r: None,
+        });
+        let c2 = top.atoms.len();
+        top.atoms.push(AtomRecord {
+            element: "C".into(),
+            name: "C2".into(),
+            mass: 12.011,
+            charge: 0.0,
+            sigma: 0.34,
+            epsilon: 0.36,
+            position: [1.65, 1.5, 1.5],
+            residue_id: 100,
+            molecule_id: 100,
+            born_r: None,
+        });
+        top.bonds.push(crate::topology::BondTerm {
+            i: c1,
+            j: c2,
+            k: 3000.0,
+            r0: 0.15,
+        });
+        let r0 = 0.109;
+        for (c_idx, dirs) in [
+            (c1, [[-0.9f64, 0.4, 0.0], [-0.9, -0.4, 0.3]]),
+            (c2, [[0.9, 0.4, 0.0], [0.9, -0.4, -0.3]]),
+        ] {
+            let base = top.atoms[c_idx].position;
+            for d in dirs {
+                let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let pos = [
+                    base[0] + r0 * d[0] / n,
+                    base[1] + r0 * d[1] / n,
+                    base[2] + r0 * d[2] / n,
+                ];
+                let h_idx = top.atoms.len();
+                top.atoms.push(AtomRecord {
+                    element: "H".into(),
+                    name: format!("H{h_idx}"),
+                    mass: 1.008,
+                    charge: 0.0,
+                    sigma: 0.0,
+                    epsilon: 0.0,
+                    position: pos,
+                    residue_id: 100,
+                    molecule_id: 100,
+                    born_r: None,
+                });
+                top.bonds.push(crate::topology::BondTerm {
+                    i: c_idx,
+                    j: h_idx,
+                    k: 3000.0,
+                    r0,
+                });
+            }
+        }
+        top.build_exclusions();
+        top
+    }
+
+    /// Runs NVE (no thermostat/barostat) velocity-Verlet for `steps` and
+    /// returns the relative drift (max-min)/|mean| of total energy over
+    /// the trajectory.
+    fn nve_energy_drift(mut state: MdState, steps: usize, cutoff: f64) -> f64 {
+        state.thermostat = Thermostat::None;
+        state.npt = false;
+        let mut totals = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let r = velocity_verlet_step(&mut state, cutoff);
+            totals.push(r.potential_energy + r.kinetic_energy);
+        }
+        let mean: f64 = totals.iter().sum::<f64>() / totals.len() as f64;
+        let max = totals.iter().cloned().fold(f64::MIN, f64::max);
+        let min = totals.iter().cloned().fold(f64::MAX, f64::min);
+        (max - min) / mean.abs().max(1e-8)
+    }
+
+    #[test]
+    fn hmr_enables_stable_4fs_nve_with_hbond_constraints() {
+        force_cpu_backend();
+
+        // Baseline: standard masses, dt = 2 fs (0.002 ps).
+        let top_2fs = water_and_solute_topology();
+        let mut state_2fs = MdState::new(top_2fs, 300.0);
+        state_2fs.timestep = 0.002;
+        state_2fs.use_constraints = true;
+        let drift_2fs = nve_energy_drift(state_2fs, 60, 1.0);
+
+        // HMR (H mass -> 3.024 Da) + h-bond constraints, dt = 4 fs (0.004 ps).
+        let mut top_4fs = water_and_solute_topology();
+        top_4fs.apply_hmr(3.024);
+        let mut state_4fs = MdState::new(top_4fs, 300.0);
+        state_4fs.timestep = 0.004;
+        state_4fs.use_constraints = true;
+        let drift_4fs = nve_energy_drift(state_4fs, 30, 1.0);
+
+        // Sanity check: both runs stay finite and bounded (no blow-up /
+        // NaN), and the 4 fs + HMR + h-bond-constrained run isn't wildly
+        // less stable than the 2 fs baseline over the same physical time.
+        assert!(drift_2fs.is_finite(), "2fs drift not finite");
+        assert!(drift_4fs.is_finite(), "4fs+HMR drift not finite");
+        assert!(drift_4fs < 5.0 * drift_2fs.max(0.05), "4fs+HMR drift {drift_4fs} too far above 2fs baseline {drift_2fs}");
     }
 
     #[test]

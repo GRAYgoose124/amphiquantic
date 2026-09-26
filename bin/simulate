@@ -98,6 +98,37 @@ def parse_args():
         default=None,
         help="Steps between Monte Carlo barostat attempts",
     )
+    parser.add_argument(
+        "--dt",
+        type=float,
+        default=None,
+        help="Integration timestep in ps (default: 0.002; use e.g. 0.004 with --hmr)",
+    )
+    parser.add_argument(
+        "--hmr",
+        action="store_true",
+        help="Hydrogen mass repartitioning (H mass -> 3.024 Da, preserving total mass)",
+    )
+    parser.add_argument(
+        "--constraints",
+        type=str,
+        default=None,
+        choices=["none", "h-bonds"],
+        help="Bond constraint mode (default: h-bonds)",
+    )
+    parser.add_argument(
+        "--constraint-algorithm",
+        type=str,
+        default=None,
+        choices=["lincs", "shake"],
+        help="Algorithm for solute H-bond constraints (default: lincs); water always uses analytic SETTLE",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Number of CPU threads for the rayon-parallel force/constraint kernels (default: all cores)",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +155,11 @@ if __name__ == "__main__":
         checkpoint_out=args.checkpoint,
         checkpoint_in=args.checkpoint_in,
         energy_log=args.energy_log,
+        dt=args.dt,
+        hmr=args.hmr,
+        constraints=args.constraints,
+        constraint_algorithm=args.constraint_algorithm,
+        threads=args.threads,
     )
     out = args.output or str(path.with_suffix(".md.aqtop"))
     top.write(out)

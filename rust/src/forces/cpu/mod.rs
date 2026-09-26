@@ -1,6 +1,40 @@
 use crate::electrostatics::pme::{self, PmeContext};
 use crate::neighbor::{build_neighbor_list, minimum_image};
 use crate::topology::Topology;
+use rayon::prelude::*;
+
+/// Accumulate (forces, energy) from independent per-item contributions in
+/// parallel: each rayon worker folds its share of items into a private
+/// (Vec<[f64;3]>, f64) buffer, and buffers are reduced pairwise at the end.
+/// This avoids any shared mutable state / locking in the hot loop while
+/// remaining numerically equivalent (to float-summation-order tolerance) to
+/// the serial accumulation.
+fn parallel_accumulate<T, F>(items: &[T], n_atoms: usize, f: F) -> (Vec<[f64; 3]>, f64)
+where
+    T: Sync,
+    F: Fn(&T, &mut [[f64; 3]], &mut f64) + Sync,
+{
+    items
+        .par_iter()
+        .fold(
+            || (vec![[0.0f64; 3]; n_atoms], 0.0f64),
+            |(mut forces, mut energy), item| {
+                f(item, &mut forces, &mut energy);
+                (forces, energy)
+            },
+        )
+        .reduce(
+            || (vec![[0.0f64; 3]; n_atoms], 0.0f64),
+            |(mut fa, ea), (fb, eb)| {
+                for (a, b) in fa.iter_mut().zip(fb.iter()) {
+                    a[0] += b[0];
+                    a[1] += b[1];
+                    a[2] += b[2];
+                }
+                (fa, ea + eb)
+            },
+        )
+}
 
 pub struct ForceResult {
     pub forces: Vec<[f64; 3]>,
@@ -13,10 +47,8 @@ const COULOMB_14_SCALE: f64 = 1.0 / 1.2;
 
 pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
     let n = topology.atoms.len();
-    let mut forces = vec![[0.0f64; 3]; n];
-    let mut potential_energy = 0.0;
 
-    for bond in &topology.bonds {
+    let (bond_forces, bond_energy) = parallel_accumulate(&topology.bonds, n, |bond, forces, energy| {
         let i = bond.i;
         let j = bond.j;
         let pi = topology.atoms[i].position;
@@ -30,10 +62,10 @@ pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
             forces[i][k] -= force_scalar * dr[k];
             forces[j][k] += force_scalar * dr[k];
         }
-        potential_energy += bond.k * dr_mag * dr_mag;
-    }
+        *energy += bond.k * dr_mag * dr_mag;
+    });
 
-    for angle in &topology.angles {
+    let (angle_forces, angle_energy) = parallel_accumulate(&topology.angles, n, |angle, forces, energy| {
         let pi = topology.atoms[angle.i].position;
         let pj = topology.atoms[angle.j].position;
         let pk = topology.atoms[angle.k].position;
@@ -42,13 +74,13 @@ pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
         let n1 = norm(b1);
         let n2 = norm(b2);
         if n1 < 1e-12 || n2 < 1e-12 {
-            continue;
+            return;
         }
         let cos_theta = (dot(b1, b2) / (n1 * n2)).clamp(-1.0, 1.0);
         let theta = cos_theta.acos();
         let dtheta = theta - angle.theta0;
         let coeff = -2.0 * angle.k_theta * dtheta;
-        potential_energy += angle.k_theta * dtheta * dtheta;
+        *energy += angle.k_theta * dtheta * dtheta;
         let inv_n1 = 1.0 / n1;
         let inv_n2 = 1.0 / n2;
         for k in 0..3 {
@@ -58,19 +90,33 @@ pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
             forces[angle.j][k] += coeff * (-d_cos_d_b1 - d_cos_d_b2);
             forces[angle.k][k] += coeff * d_cos_d_b2;
         }
-    }
+    });
 
-    for dihedral in topology
+    let dihedrals: Vec<&crate::topology::DihedralTerm> = topology
         .dihedrals
         .iter()
         .chain(topology.impropers.iter())
-    {
-        add_dihedral_forces(topology, dihedral, &mut forces, &mut potential_energy);
+        .collect();
+    let (dihedral_forces, dihedral_energy) =
+        parallel_accumulate(&dihedrals, n, |dihedral, forces, energy| {
+            add_dihedral_forces(topology, *dihedral, forces, energy);
+        });
+
+    let mut forces = bond_forces;
+    for (a, b) in forces.iter_mut().zip(angle_forces.iter()) {
+        a[0] += b[0];
+        a[1] += b[1];
+        a[2] += b[2];
+    }
+    for (a, b) in forces.iter_mut().zip(dihedral_forces.iter()) {
+        a[0] += b[0];
+        a[1] += b[1];
+        a[2] += b[2];
     }
 
     ForceResult {
         forces,
-        potential_energy,
+        potential_energy: bond_energy + angle_energy + dihedral_energy,
     }
 }
 
@@ -80,55 +126,56 @@ pub fn compute_nonbonded_forces(
     pme: Option<&PmeContext>,
 ) -> ForceResult {
     let n = topology.atoms.len();
-    let mut forces = vec![[0.0f64; 3]; n];
-    let mut potential_energy = 0.0;
 
     let nl = build_neighbor_list(topology, cutoff);
     let pairs_14 = build_14_pairs(topology);
 
-    for &(i, j) in &nl.pairs {
-        let pi = topology.atoms[i].position;
-        let pj = topology.atoms[j].position;
-        let qi = topology.atoms[i].charge;
-        let qj = topology.atoms[j].charge;
-        let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
-        let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
-        let mut coulomb_scale = 1.0;
-        if pairs_14.contains(&(i.min(j), i.max(j))) {
-            epsilon *= LJ_14_SCALE;
-            coulomb_scale = COULOMB_14_SCALE;
-        }
-        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-        dr = minimum_image(dr, &topology.box_);
-        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-        let r = r2.sqrt().max(1e-12);
-
-        if sigma > 1e-8 && epsilon > 1e-12 {
-            let sr = sigma / r;
-            let sr6 = sr.powi(6);
-            let sr12 = sr6 * sr6;
-            let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-            let lj_energy = 4.0 * epsilon * (sr12 - sr6);
-            potential_energy += lj_energy;
-            for k in 0..3 {
-                forces[i][k] -= lj_force_scalar * dr[k];
-                forces[j][k] += lj_force_scalar * dr[k];
+    let (mut forces, mut potential_energy) =
+        parallel_accumulate(&nl.pairs, n, |&(i, j), forces, energy| {
+            let pi = topology.atoms[i].position;
+            let pj = topology.atoms[j].position;
+            let qi = topology.atoms[i].charge;
+            let qj = topology.atoms[j].charge;
+            let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
+            let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+            let mut coulomb_scale = 1.0;
+            if pairs_14.contains(&(i.min(j), i.max(j))) {
+                epsilon *= LJ_14_SCALE;
+                coulomb_scale = COULOMB_14_SCALE;
             }
-        }
+            let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+            dr = minimum_image(dr, &topology.box_);
+            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+            let r = r2.sqrt().max(1e-12);
 
-        let (coul_energy, coul_force) = if let Some(ctx) = pme {
-            crate::electrostatics::ewald::screened_coulomb_energy_force(
-                qi, qj, r, r2, ctx.alpha, coulomb_scale,
-            )
-        } else {
-            crate::electrostatics::ewald::direct_coulomb_energy_force(qi, qj, r, r2, coulomb_scale)
-        };
-        potential_energy += coul_energy;
-        for k in 0..3 {
-            forces[i][k] -= coul_force * dr[k];
-            forces[j][k] += coul_force * dr[k];
-        }
-    }
+            if sigma > 1e-8 && epsilon > 1e-12 {
+                let sr = sigma / r;
+                let sr6 = sr.powi(6);
+                let sr12 = sr6 * sr6;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                let lj_energy = 4.0 * epsilon * (sr12 - sr6);
+                *energy += lj_energy;
+                for k in 0..3 {
+                    forces[i][k] -= lj_force_scalar * dr[k];
+                    forces[j][k] += lj_force_scalar * dr[k];
+                }
+            }
+
+            let (coul_energy, coul_force) = if let Some(ctx) = pme {
+                crate::electrostatics::ewald::screened_coulomb_energy_force(
+                    qi, qj, r, r2, ctx.alpha, coulomb_scale,
+                )
+            } else {
+                crate::electrostatics::ewald::direct_coulomb_energy_force(
+                    qi, qj, r, r2, coulomb_scale,
+                )
+            };
+            *energy += coul_energy;
+            for k in 0..3 {
+                forces[i][k] -= coul_force * dr[k];
+                forces[j][k] += coul_force * dr[k];
+            }
+        });
 
     if let Some(ctx) = pme {
         let pme_result = pme::compute_pme_forces(topology, ctx);
@@ -153,39 +200,38 @@ pub fn compute_forces(topology: &Topology, cutoff: f64) -> ForceResult {
 /// Lennard-Jones nonbonded only (implicit GB path).
 pub fn compute_lj_forces(topology: &Topology, cutoff: f64) -> ForceResult {
     let n = topology.atoms.len();
-    let mut forces = vec![[0.0f64; 3]; n];
-    let mut potential_energy = 0.0;
 
     let nl = build_neighbor_list(topology, cutoff);
     let pairs_14 = build_14_pairs(topology);
 
-    for &(i, j) in &nl.pairs {
-        let pi = topology.atoms[i].position;
-        let pj = topology.atoms[j].position;
-        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-        dr = minimum_image(dr, &topology.box_);
-        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-        let r = r2.sqrt().max(1e-12);
+    let (forces, potential_energy) =
+        parallel_accumulate(&nl.pairs, n, |&(i, j), forces, energy| {
+            let pi = topology.atoms[i].position;
+            let pj = topology.atoms[j].position;
+            let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+            dr = minimum_image(dr, &topology.box_);
+            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+            let r = r2.sqrt().max(1e-12);
 
-        let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
-        let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
-        if pairs_14.contains(&(i.min(j), i.max(j))) {
-            epsilon *= LJ_14_SCALE;
-        }
-
-        if sigma > 1e-8 && epsilon > 1e-12 {
-            let sr = sigma / r;
-            let sr6 = sr.powi(6);
-            let sr12 = sr6 * sr6;
-            let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-            let lj_energy = 4.0 * epsilon * (sr12 - sr6);
-            potential_energy += lj_energy;
-            for k in 0..3 {
-                forces[i][k] -= lj_force_scalar * dr[k];
-                forces[j][k] += lj_force_scalar * dr[k];
+            let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
+            let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+            if pairs_14.contains(&(i.min(j), i.max(j))) {
+                epsilon *= LJ_14_SCALE;
             }
-        }
-    }
+
+            if sigma > 1e-8 && epsilon > 1e-12 {
+                let sr = sigma / r;
+                let sr6 = sr.powi(6);
+                let sr12 = sr6 * sr6;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                let lj_energy = 4.0 * epsilon * (sr12 - sr6);
+                *energy += lj_energy;
+                for k in 0..3 {
+                    forces[i][k] -= lj_force_scalar * dr[k];
+                    forces[j][k] += lj_force_scalar * dr[k];
+                }
+            }
+        });
 
     ForceResult {
         forces,
@@ -220,19 +266,21 @@ pub fn merge_force_results(a: ForceResult, b: ForceResult) -> ForceResult {
 /// Angle/dihedral (3/4-body) contributions are not included: this is a
 /// standard, minor approximation for the scalar pressure estimate.
 pub fn compute_bonded_virial(topology: &Topology) -> f64 {
-    let mut virial = 0.0;
-    for bond in &topology.bonds {
-        let pi = topology.atoms[bond.i].position;
-        let pj = topology.atoms[bond.j].position;
-        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-        dr = minimum_image(dr, &topology.box_);
-        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-        let r = r2.sqrt().max(1e-12);
-        let dr_mag = r - bond.r0;
-        let force_scalar = -2.0 * bond.k * dr_mag / r;
-        virial += force_scalar * r2;
-    }
-    virial
+    topology
+        .bonds
+        .par_iter()
+        .map(|bond| {
+            let pi = topology.atoms[bond.i].position;
+            let pj = topology.atoms[bond.j].position;
+            let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+            dr = minimum_image(dr, &topology.box_);
+            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+            let r = r2.sqrt().max(1e-12);
+            let dr_mag = r - bond.r0;
+            let force_scalar = -2.0 * bond.k * dr_mag / r;
+            force_scalar * r2
+        })
+        .sum()
 }
 
 /// Pairwise virial from nonbonded LJ + direct Coulomb interactions within
@@ -241,37 +289,45 @@ pub fn compute_bonded_virial(topology: &Topology) -> f64 {
 pub fn compute_nonbonded_virial(topology: &Topology, cutoff: f64) -> f64 {
     let nl = build_neighbor_list(topology, cutoff);
     let pairs_14 = build_14_pairs(topology);
-    let mut virial = 0.0;
-    for &(i, j) in &nl.pairs {
-        let pi = topology.atoms[i].position;
-        let pj = topology.atoms[j].position;
-        let qi = topology.atoms[i].charge;
-        let qj = topology.atoms[j].charge;
-        let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
-        let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
-        let mut coulomb_scale = 1.0;
-        if pairs_14.contains(&(i.min(j), i.max(j))) {
-            epsilon *= LJ_14_SCALE;
-            coulomb_scale = COULOMB_14_SCALE;
-        }
-        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-        dr = minimum_image(dr, &topology.box_);
-        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-        let r = r2.sqrt().max(1e-12);
+    nl.pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            let pi = topology.atoms[i].position;
+            let pj = topology.atoms[j].position;
+            let qi = topology.atoms[i].charge;
+            let qj = topology.atoms[j].charge;
+            let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
+            let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+            let mut coulomb_scale = 1.0;
+            if pairs_14.contains(&(i.min(j), i.max(j))) {
+                epsilon *= LJ_14_SCALE;
+                coulomb_scale = COULOMB_14_SCALE;
+            }
+            let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+            dr = minimum_image(dr, &topology.box_);
+            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+            let r = r2.sqrt().max(1e-12);
 
-        if sigma > 1e-8 && epsilon > 1e-12 {
-            let sr = sigma / r;
-            let sr6 = sr.powi(6);
-            let sr12 = sr6 * sr6;
-            let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-            virial += lj_force_scalar * r2;
-        }
+            let mut v = 0.0;
+            if sigma > 1e-8 && epsilon > 1e-12 {
+                let sr = sigma / r;
+                let sr6 = sr.powi(6);
+                let sr12 = sr6 * sr6;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                v += lj_force_scalar * r2;
+            }
 
-        let (_, coul_force) =
-            crate::electrostatics::ewald::direct_coulomb_energy_force(qi, qj, r, r2, coulomb_scale);
-        virial += coul_force * r2;
-    }
-    virial
+            let (_, coul_force) = crate::electrostatics::ewald::direct_coulomb_energy_force(
+                qi,
+                qj,
+                r,
+                r2,
+                coulomb_scale,
+            );
+            v += coul_force * r2;
+            v
+        })
+        .sum()
 }
 
 /// Total scalar virial W = sum r_ij . f_ij used for pressure:
@@ -365,7 +421,150 @@ fn scale(v: [f64; 3], s: f64) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{AtomRecord, BondTerm, DihedralTerm, Topology};
+    use crate::topology::{AtomRecord, BondTerm, DihedralTerm, SimulationBox, Topology};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn random_solvated_topology(n_waters: usize, seed: u64) -> Topology {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut top = Topology::new();
+        let extent = 4.0;
+        top.box_ = SimulationBox {
+            lx: extent,
+            ly: extent,
+            lz: extent,
+            pbc: true,
+        };
+        let roh = 0.09572;
+        let hoh = 1.824218134_f64;
+        for w in 0..n_waters {
+            let base = [
+                rng.gen_range(0.0..extent),
+                rng.gen_range(0.0..extent),
+                rng.gen_range(0.0..extent),
+            ];
+            let o_idx = top.atoms.len();
+            top.atoms.push(AtomRecord {
+                element: "O".into(),
+                name: "O".into(),
+                mass: 15.999,
+                charge: -0.834,
+                sigma: 0.315,
+                epsilon: 0.636,
+                position: base,
+                residue_id: w as u32,
+                molecule_id: w as u32,
+                born_r: None,
+            });
+            let h1 = [base[0] + roh, base[1], base[2]];
+            let h2 = [
+                base[0] + roh * hoh.cos(),
+                base[1] + roh * hoh.sin(),
+                base[2],
+            ];
+            for (name, pos) in [("H1", h1), ("H2", h2)] {
+                top.atoms.push(AtomRecord {
+                    element: "H".into(),
+                    name: name.into(),
+                    mass: 1.008,
+                    charge: 0.417,
+                    sigma: 0.0,
+                    epsilon: 0.0,
+                    position: pos,
+                    residue_id: w as u32,
+                    molecule_id: w as u32,
+                    born_r: None,
+                });
+            }
+            top.bonds.push(BondTerm {
+                i: o_idx,
+                j: o_idx + 1,
+                k: 5000.0,
+                r0: roh,
+            });
+            top.bonds.push(BondTerm {
+                i: o_idx,
+                j: o_idx + 2,
+                k: 5000.0,
+                r0: roh,
+            });
+        }
+        top.build_exclusions();
+        top
+    }
+
+    /// Parallel (rayon, default thread pool) nonbonded + bonded forces must
+    /// match a forced single-thread evaluation to <1e-10 relative error:
+    /// the same per-item math runs either way, only the reduction order
+    /// (and hence floating-point summation order) differs.
+    #[test]
+    fn parallel_forces_match_single_threaded() {
+        let top = random_solvated_topology(80, 11);
+        let cutoff = 1.0;
+
+        let parallel = compute_forces(&top, cutoff);
+
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| compute_forces(&top, cutoff));
+
+        let e_rel = ((parallel.potential_energy - single.potential_energy)
+            / single.potential_energy.abs().max(1e-12))
+        .abs();
+        assert!(e_rel < 1e-10, "energy rel diff = {e_rel}");
+
+        for (fa, fb) in parallel.forces.iter().zip(single.forces.iter()) {
+            for k in 0..3 {
+                let scale = fb[k].abs().max(1.0);
+                let rel = (fa[k] - fb[k]).abs() / scale;
+                assert!(rel < 1e-10, "force component rel diff = {rel}");
+            }
+        }
+    }
+
+    /// Benchmark: report the wall-clock speedup of the (default, all-core)
+    /// rayon-parallel force evaluation vs a forced single-thread run on a
+    /// moderately large system. Not a strict pass/fail gate on absolute
+    /// speedup (CI machines vary in core count), just prints the measured
+    /// number for visibility, and sanity-checks it's not a slowdown.
+    #[test]
+    fn benchmark_parallel_speedup_vs_single_thread() {
+        let top = random_solvated_topology(600, 7);
+        let cutoff = 1.0;
+        let iters = 5;
+
+        let single_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let t0 = std::time::Instant::now();
+        single_pool.install(|| {
+            for _ in 0..iters {
+                let _ = compute_forces(&top, cutoff);
+            }
+        });
+        let single_elapsed = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = compute_forces(&top, cutoff);
+        }
+        let parallel_elapsed = t1.elapsed();
+
+        let speedup = single_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(1e-12);
+        println!(
+            "[benchmark] rayon threads = {}, single-thread = {:?}, parallel = {:?}, speedup = {:.2}x",
+            rayon::current_num_threads(),
+            single_elapsed,
+            parallel_elapsed,
+            speedup
+        );
+        // On a multi-core CI runner this should be faster; guard loosely
+        // against a pathological regression rather than requiring a fixed
+        // multiplier (thread count varies by machine).
+        if rayon::current_num_threads() > 1 {
+            assert!(speedup > 0.8, "parallel run should not be slower: {speedup:.2}x");
+        }
+    }
 
     #[test]
     fn bonded_energy_finite() {

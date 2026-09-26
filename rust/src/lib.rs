@@ -17,6 +17,7 @@ mod utilities;
 
 use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, run_md, AtomPipelineParams};
+use constraints::{build_constraints_with_algorithm, ConstraintAlgorithm};
 use integrator::{md_step, parse_barostat, parse_thermostat, Barostat, MdState, Restraint};
 use minimize::minimize;
 use forces::{backend_from_env, compute_forces};
@@ -27,6 +28,59 @@ use trajectory::{
     read_checkpoint, read_dcd, write_checkpoint, Checkpoint, EnergyLogWriter, TrajectoryFormat,
     TrajectoryReader, TrajectoryWriter,
 };
+
+/// Default hydrogen mass (Da) used by hydrogen mass repartitioning when
+/// `--hmr` is requested without an explicit mass.
+const DEFAULT_HMR_MASS: f64 = 3.024;
+
+/// Set the global rayon thread pool size, if requested and not already set
+/// for this process (rayon's global pool can only be configured once).
+fn apply_thread_override(threads: Option<usize>) -> PyResult<()> {
+    if let Some(n) = threads {
+        // Building the global pool a second time (e.g. a second simulate()
+        // call in the same process) errors; that's fine to ignore since the
+        // pool is already configured (possibly by an earlier call).
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+    }
+    Ok(())
+}
+
+/// Apply `--dt` / `--constraints` / `--constraint-algorithm` overrides to an
+/// already-constructed `MdState`.
+fn apply_dt_and_constraint_overrides(
+    state: &mut MdState,
+    dt: Option<f64>,
+    constraints_mode: Option<&str>,
+    constraint_algorithm: Option<&str>,
+) -> PyResult<()> {
+    if let Some(dt) = dt {
+        state.timestep = dt;
+    }
+    if let Some(mode) = constraints_mode {
+        match mode {
+            "none" => state.use_constraints = false,
+            "h-bonds" => state.use_constraints = true,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown --constraints value '{other}' (expected 'none' or 'h-bonds')"
+                )))
+            }
+        }
+    }
+    if let Some(algo) = constraint_algorithm {
+        let algorithm = match algo {
+            "lincs" => ConstraintAlgorithm::Lincs,
+            "shake" => ConstraintAlgorithm::Shake,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown --constraint-algorithm value '{other}' (expected 'lincs' or 'shake')"
+                )))
+            }
+        };
+        state.constraints = Some(build_constraints_with_algorithm(&state.topology, algorithm));
+    }
+    Ok(())
+}
 
 #[pyfunction]
 fn load_topology(path: &str) -> PyResult<TopologyPy> {
@@ -142,7 +196,12 @@ fn write_final_checkpoint(
     traj_format=None,
     checkpoint_out=None,
     checkpoint_in=None,
-    energy_log=None
+    energy_log=None,
+    dt=None,
+    hmr=None,
+    constraints=None,
+    constraint_algorithm=None,
+    threads=None
 ))]
 fn equilibrate_topology(
     path: &str,
@@ -163,8 +222,17 @@ fn equilibrate_topology(
     checkpoint_out: Option<&str>,
     checkpoint_in: Option<&str>,
     energy_log: Option<&str>,
+    dt: Option<f64>,
+    hmr: Option<bool>,
+    constraints: Option<&str>,
+    constraint_algorithm: Option<&str>,
+    threads: Option<usize>,
 ) -> PyResult<(TopologyPy, f64, f64)> {
+    apply_thread_override(threads)?;
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    if hmr.unwrap_or(false) {
+        top.apply_hmr(DEFAULT_HMR_MASS);
+    }
     let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
     if let Some(restart) = restart_traj {
         TrajectoryReader::new(restart)
@@ -174,6 +242,7 @@ fn equilibrate_topology(
     let n_steps = steps.unwrap_or(100);
     let temp = temperature.unwrap_or(300.0);
     let mut state = MdState::new(top.clone(), temp);
+    apply_dt_and_constraint_overrides(&mut state, dt, constraints, constraint_algorithm)?;
     let mut seed = 0u64;
     if let Some(ckpt_path) = checkpoint_in {
         let ckpt = read_checkpoint(ckpt_path).map_err(pyo3::exceptions::PyIOError::new_err)?;
@@ -264,7 +333,12 @@ fn equilibrate_topology(
     traj_format=None,
     checkpoint_out=None,
     checkpoint_in=None,
-    energy_log=None
+    energy_log=None,
+    dt=None,
+    hmr=None,
+    constraints=None,
+    constraint_algorithm=None,
+    threads=None
 ))]
 fn simulate_topology(
     path: &str,
@@ -285,8 +359,17 @@ fn simulate_topology(
     checkpoint_out: Option<&str>,
     checkpoint_in: Option<&str>,
     energy_log: Option<&str>,
+    dt: Option<f64>,
+    hmr: Option<bool>,
+    constraints: Option<&str>,
+    constraint_algorithm: Option<&str>,
+    threads: Option<usize>,
 ) -> PyResult<(TopologyPy, f64, f64)> {
+    apply_thread_override(threads)?;
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    if hmr.unwrap_or(false) {
+        top.apply_hmr(DEFAULT_HMR_MASS);
+    }
     if let Some(restart) = restart_traj {
         TrajectoryReader::new(restart)
             .apply_last_frame(&mut top)
@@ -296,6 +379,7 @@ fn simulate_topology(
     let temp = temperature.unwrap_or(300.0);
     let mut state = MdState::new(top.clone(), temp);
     state.use_constraints = true;
+    apply_dt_and_constraint_overrides(&mut state, dt, constraints, constraint_algorithm)?;
     let mut seed = 0u64;
     if let Some(ckpt_path) = checkpoint_in {
         let ckpt = read_checkpoint(ckpt_path).map_err(pyo3::exceptions::PyIOError::new_err)?;
