@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import os
 from pathlib import Path
 
-from rustquantic import simulate_topology
+from rustquantic import simulate_topology, simulate_topology_gpu_resident
 
 
 def parse_args():
@@ -129,12 +130,57 @@ def parse_args():
         default=None,
         help="Number of CPU threads for the rayon-parallel force/constraint kernels (default: all cores)",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        choices=["cpu", "gpu", "hybrid", "gpu-resident"],
+        help=(
+            "Force evaluation backend (default: hybrid, or $AMPHI_FORCE_BACKEND). "
+            "'gpu-resident' keeps positions/velocities/forces resident on the GPU "
+            "across steps (see docs/gpu_resident.md) and currently only supports "
+            "--thermostat in {none, vrescale, langevin} with no barostat and no "
+            "solute LINCS/SHAKE constraints."
+        ),
+    )
     return parser.parse_args()
+
+
+def _run_gpu_resident(args, path: Path):
+    if args.npt or args.barostat:
+        raise SystemExit("--backend gpu-resident does not support NPT/barostats yet")
+    if args.thermostat not in ("none", "vrescale", "langevin"):
+        raise SystemExit(
+            f"--backend gpu-resident supports --thermostat in {{none, vrescale, langevin}}, got {args.thermostat!r}"
+        )
+    traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
+    top, final_temperature = simulate_topology_gpu_resident(
+        str(path),
+        traj,
+        args.steps,
+        args.temperature,
+        args.dt,
+        args.thermostat,
+        args.tau_t,
+        None,
+        args.energy_log,
+        None,
+    )
+    out = args.output or str(path.with_suffix(".md.aqtop"))
+    top.write(out)
+    print(f"Simulated (gpu-resident) → {out}, trajectory {traj} (final T={final_temperature:.1f} K)")
 
 
 if __name__ == "__main__":
     args = parse_args()
     path = Path(args.input)
+    if args.backend:
+        os.environ["AMPHI_FORCE_BACKEND"] = args.backend
+        if args.backend != "hybrid":
+            os.environ["AMPHI_HYBRID"] = "0"
+    if args.backend == "gpu-resident":
+        _run_gpu_resident(args, path)
+        raise SystemExit(0)
     traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
     top, final_temperature, final_pressure = simulate_topology(
         str(path),

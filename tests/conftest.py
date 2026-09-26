@@ -65,6 +65,11 @@ def force_backend_gpu(monkeypatch):
 
 
 @pytest.fixture
+def force_backend_gpu_resident(monkeypatch):
+    monkeypatch.setenv("AMPHI_FORCE_BACKEND", "gpu-resident")
+
+
+@pytest.fixture
 def ala_pdb(tmp_path, repo_root) -> Path:
     src = FIXTURES / "ala.pdb"
     if src.exists():

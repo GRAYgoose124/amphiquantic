@@ -58,6 +58,9 @@ pub fn hybrid_enabled() -> bool {
     match std::env::var("AMPHI_HYBRID").as_deref() {
         Ok("0") | Ok("false") => false,
         Ok("1") | Ok("true") => true,
-        _ => std::env::var("AMPHI_FORCE_BACKEND").as_deref() != Ok("cpu"),
+        _ => !matches!(
+            std::env::var("AMPHI_FORCE_BACKEND").as_deref(),
+            Ok("cpu") | Ok("gpu-resident")
+        ),
     }
 }
