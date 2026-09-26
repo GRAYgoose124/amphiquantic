@@ -1,5 +1,43 @@
 use crate::topology::Topology;
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use std::collections::HashMap;
+
+/// Precomputed per-atom sorted exclusion lists: `list[i]` holds every `j > i`
+/// excluded from nonbonded interaction with atom `i`, sorted ascending. This
+/// replaces a `HashSet<(usize, usize)>` lookup (hashing a tuple key on every
+/// candidate pair, in the hottest loop in the neighbor builder) with a
+/// binary search into a short, cache-friendly, contiguous `Vec<u32>` -- both
+/// asymptotically cheaper per lookup and far more cache-friendly, since
+/// exclusion lists per atom are tiny (a handful of bonded/angle/dihedral
+/// partners) and built once per neighbor-list rebuild.
+struct ExclusionLists {
+    by_atom: Vec<Vec<u32>>,
+}
+
+impl ExclusionLists {
+    fn build(topology: &Topology) -> Self {
+        let n = topology.atoms.len();
+        let mut by_atom: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for e in &topology.exclusions {
+            let (a, b) = (e[0], e[1]);
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            if lo != hi {
+                by_atom[lo].push(hi as u32);
+            }
+        }
+        for list in by_atom.iter_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+        ExclusionLists { by_atom }
+    }
+
+    #[inline]
+    fn contains(&self, a: usize, b: usize) -> bool {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        self.by_atom[lo].binary_search(&(hi as u32)).is_ok()
+    }
+}
 
 pub struct NeighborList {
     pub pairs: Vec<(usize, usize)>,
@@ -24,7 +62,7 @@ pub fn build_neighbor_list(topology: &Topology, cutoff: f64) -> NeighborList {
         return NeighborList { pairs: vec![] };
     }
 
-    let exclusions = build_exclusion_set(topology);
+    let exclusions = ExclusionLists::build(topology);
     let cutoff_sq = cutoff * cutoff;
 
     if n < CELL_LIST_THRESHOLD {
@@ -41,14 +79,14 @@ pub fn build_neighbor_list(topology: &Topology, cutoff: f64) -> NeighborList {
 /// Force the brute-force O(N^2) builder regardless of system size. Used by
 /// parity tests to compare against the cell-list builder.
 pub fn build_neighbor_list_naive(topology: &Topology, cutoff: f64) -> NeighborList {
-    let exclusions = build_exclusion_set(topology);
+    let exclusions = ExclusionLists::build(topology);
     build_naive(topology, cutoff * cutoff, &exclusions)
 }
 
 /// Force the cell-linked-list builder regardless of system size. Used by
 /// parity tests to compare against the brute-force builder on small systems.
 pub fn build_neighbor_list_cells(topology: &Topology, cutoff: f64) -> NeighborList {
-    let exclusions = build_exclusion_set(topology);
+    let exclusions = ExclusionLists::build(topology);
     if topology.atoms.is_empty() {
         return NeighborList { pairs: vec![] };
     }
@@ -59,27 +97,29 @@ pub fn build_neighbor_list_cells(topology: &Topology, cutoff: f64) -> NeighborLi
     }
 }
 
-fn build_exclusion_set(topology: &Topology) -> HashSet<(usize, usize)> {
-    topology
-        .exclusions
-        .iter()
-        .map(|e| (e[0], e[1]))
-        .collect()
-}
-
+/// This is only ever used below `CELL_LIST_THRESHOLD` atoms, where the
+/// O(N^2) work itself is small (a few tens of thousands of candidate pairs
+/// at most): kept a plain serial scan deliberately, rather than parallel,
+/// both because there is essentially nothing to gain from parallelizing at
+/// this scale and because doing so would make small-system neighbor lists
+/// (and hence, downstream, whole trajectories) sensitive to run-to-run
+/// floating-point summation-order differences from thread scheduling --
+/// harmless for large-N statistics but able to visibly perturb a short,
+/// small-N deterministic trajectory (e.g. the tiny-system energy-drift
+/// tests) run over run.
 fn build_naive(
     topology: &Topology,
     cutoff_sq: f64,
-    exclusions: &HashSet<(usize, usize)>,
+    exclusions: &ExclusionLists,
 ) -> NeighborList {
     let n = topology.atoms.len();
     let mut pairs = Vec::new();
     for i in 0..n {
+        let pi = topology.atoms[i].position;
         for j in (i + 1)..n {
-            if exclusions.contains(&(i, j)) {
+            if exclusions.contains(i, j) {
                 continue;
             }
-            let pi = topology.atoms[i].position;
             let pj = topology.atoms[j].position;
             let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
             dr = minimum_image(dr, &topology.box_);
@@ -99,7 +139,7 @@ fn build_cell_list_periodic(
     topology: &Topology,
     cutoff: f64,
     cutoff_sq: f64,
-    exclusions: &HashSet<(usize, usize)>,
+    exclusions: &ExclusionLists,
 ) -> NeighborList {
     let box_ = &topology.box_;
     let lx = box_.lx.max(1e-6);
@@ -135,58 +175,68 @@ fn build_cell_list_periodic(
     let oy = offsets(ny);
     let oz = offsets(nz);
 
-    let mut pairs = Vec::new();
-    let mut seen_cell_pairs: HashSet<((i32, i32, i32), (i32, i32, i32))> = HashSet::new();
-    for (&(cx, cy, cz), members) in &cells {
-        for &dx in &ox {
-            for &dy in &oy {
-                for &dz in &oz {
-                    let nc = (
-                        (cx + dx).rem_euclid(nx),
-                        (cy + dy).rem_euclid(ny),
-                        (cz + dz).rem_euclid(nz),
-                    );
-                    let this_cell = (cx, cy, cz);
-                    // Each unordered pair of cells should only be scanned once.
-                    let key = if this_cell <= nc {
-                        (this_cell, nc)
-                    } else {
-                        (nc, this_cell)
-                    };
-                    if this_cell != nc && !seen_cell_pairs.insert(key) {
-                        continue;
-                    }
-                    let Some(neighbors) = cells.get(&nc) else {
-                        continue;
-                    };
-                    for &i in members {
-                        for &j in neighbors {
-                            if this_cell == nc && j <= i {
-                                continue;
-                            }
-                            let (a, b) = if i < j { (i, j) } else { (j, i) };
-                            if a == b || exclusions.contains(&(a, b)) {
-                                continue;
-                            }
-                            let pi = topology.atoms[a].position;
-                            let pj = topology.atoms[b].position;
-                            let dr = minimum_image(
-                                [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]],
-                                box_,
-                            );
-                            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-                            if r2 <= cutoff_sq {
-                                pairs.push((a, b));
+    // Scanned in parallel over the occupied cells: each unordered pair of
+    // cells is visited exactly once by only descending into a neighbor cell
+    // `nc` when `nc >= this_cell` in tuple order (symmetric to the
+    // non-periodic builder below). This holds under wraparound too, since
+    // the +/-1 offset stencil is symmetric: whichever of the two cells in a
+    // pair is "smaller" always has an offset reaching the other, so exactly
+    // one direction passes the filter -- no shared "seen" set needed, which
+    // is what makes this safe to parallelize per-cell with no coordination.
+    let cell_entries: Vec<(&(i32, i32, i32), &Vec<usize>)> = cells.iter().collect();
+    let pairs: Vec<(usize, usize)> = cell_entries
+        .par_iter()
+        .with_min_len((cell_entries.len() / (rayon::current_num_threads().max(1) * 4)).max(1))
+        .flat_map_iter(|&(&(cx, cy, cz), members)| {
+            let this_cell = (cx, cy, cz);
+            let mut local = Vec::new();
+            for &dx in &ox {
+                for &dy in &oy {
+                    for &dz in &oz {
+                        let nc = (
+                            (cx + dx).rem_euclid(nx),
+                            (cy + dy).rem_euclid(ny),
+                            (cz + dz).rem_euclid(nz),
+                        );
+                        if nc < this_cell {
+                            continue;
+                        }
+                        let Some(neighbors) = cells.get(&nc) else {
+                            continue;
+                        };
+                        for &i in members {
+                            for &j in neighbors {
+                                if this_cell == nc && j <= i {
+                                    continue;
+                                }
+                                let (a, b) = if i < j { (i, j) } else { (j, i) };
+                                if a == b || exclusions.contains(a, b) {
+                                    continue;
+                                }
+                                let pi = topology.atoms[a].position;
+                                let pj = topology.atoms[b].position;
+                                let dr = minimum_image(
+                                    [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]],
+                                    box_,
+                                );
+                                let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+                                if r2 <= cutoff_sq {
+                                    local.push((a, b));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            local
+        })
+        .collect();
 
-    pairs.sort_unstable();
-    pairs.dedup();
+    // Each unordered pair of cells (hence each atom pair) is visited from
+    // exactly one direction by construction (see the ordering filter
+    // above), so no cross-cell duplicate pairs can occur here -- skipping
+    // the sort+dedup that used to guard against them avoids an O(n log n)
+    // serial bottleneck that dominated wall time at high pair counts.
     NeighborList { pairs }
 }
 
@@ -197,7 +247,7 @@ fn build_cell_list_aperiodic(
     topology: &Topology,
     cutoff: f64,
     cutoff_sq: f64,
-    exclusions: &HashSet<(usize, usize)>,
+    exclusions: &ExclusionLists,
 ) -> NeighborList {
     let n = topology.atoms.len();
     let cell_size = cutoff.max(1e-6);
@@ -225,47 +275,56 @@ fn build_cell_list_aperiodic(
         cells.entry(c).or_default().push(idx);
     }
 
-    let mut pairs = Vec::new();
-    for (&(cx, cy, cz), members) in &cells {
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    // Only scan each unordered cell pair once: visit the
-                    // neighbor cell only if it's lexicographically >= this
-                    // cell (this also naturally covers the self-cell case).
-                    let nc = (cx + dx, cy + dy, cz + dz);
-                    if nc < (cx, cy, cz) {
-                        continue;
-                    }
-                    let Some(neighbors) = cells.get(&nc) else {
-                        continue;
-                    };
-                    let same_cell = nc == (cx, cy, cz);
-                    for &i in members {
-                        for &j in neighbors {
-                            if same_cell && j <= i {
-                                continue;
-                            }
-                            let (a, b) = if i < j { (i, j) } else { (j, i) };
-                            if a == b || exclusions.contains(&(a, b)) {
-                                continue;
-                            }
-                            let pi = topology.atoms[a].position;
-                            let pj = topology.atoms[b].position;
-                            let dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
-                            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
-                            if r2 <= cutoff_sq {
-                                pairs.push((a, b));
+    let cell_entries: Vec<(&(i64, i64, i64), &Vec<usize>)> = cells.iter().collect();
+    let pairs: Vec<(usize, usize)> = cell_entries
+        .par_iter()
+        .with_min_len((cell_entries.len() / (rayon::current_num_threads().max(1) * 4)).max(1))
+        .flat_map_iter(|&(&(cx, cy, cz), members)| {
+            let mut local = Vec::new();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        // Only scan each unordered cell pair once: visit the
+                        // neighbor cell only if it's lexicographically >= this
+                        // cell (this also naturally covers the self-cell case).
+                        let nc = (cx + dx, cy + dy, cz + dz);
+                        if nc < (cx, cy, cz) {
+                            continue;
+                        }
+                        let Some(neighbors) = cells.get(&nc) else {
+                            continue;
+                        };
+                        let same_cell = nc == (cx, cy, cz);
+                        for &i in members {
+                            for &j in neighbors {
+                                if same_cell && j <= i {
+                                    continue;
+                                }
+                                let (a, b) = if i < j { (i, j) } else { (j, i) };
+                                if a == b || exclusions.contains(a, b) {
+                                    continue;
+                                }
+                                let pi = topology.atoms[a].position;
+                                let pj = topology.atoms[b].position;
+                                let dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+                                let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+                                if r2 <= cutoff_sq {
+                                    local.push((a, b));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            local
+        })
+        .collect();
 
-    pairs.sort_unstable();
-    pairs.dedup();
+    // Each unordered pair of cells (hence each atom pair) is visited from
+    // exactly one direction by construction (see the ordering filter
+    // above), so no cross-cell duplicate pairs can occur here -- skipping
+    // the sort+dedup that used to guard against them avoids an O(n log n)
+    // serial bottleneck that dominated wall time at high pair counts.
     NeighborList { pairs }
 }
 
