@@ -2,7 +2,7 @@ pub mod cpu;
 pub mod gpu;
 pub mod hybrid;
 
-use crate::electrostatics::ewald_energy_correction;
+use crate::electrostatics::{ewald_energy_correction_with_alpha, excluded_pair_correction};
 use crate::topology::Topology;
 use cpu::ForceResult as CpuForceResult;
 
@@ -33,7 +33,7 @@ pub fn compute_forces(topology: &Topology, cutoff: f64, backend: ForceBackend) -
                 let ctx = crate::electrostatics::pme::PmeContext::new(topology, cutoff);
                 let mut result =
                     cpu::compute_forces_with_pme(topology, cutoff, Some(&ctx));
-                result.potential_energy += ewald_energy_correction(topology);
+                result.potential_energy += ewald_energy_correction_with_alpha(topology, ctx.alpha);
                 result
             } else {
                 cpu::compute_forces(topology, cutoff)
@@ -51,7 +51,17 @@ pub fn compute_forces(topology: &Topology, cutoff: f64, backend: ForceBackend) -
                     f[1] += fp[1];
                     f[2] += fp[2];
                 }
-                result.potential_energy += pme.energy + ewald_energy_correction(topology);
+                result.potential_energy +=
+                    pme.energy + ewald_energy_correction_with_alpha(topology, ctx.alpha);
+
+                let (excl_energy, excl_forces, _) =
+                    excluded_pair_correction(topology, ctx.alpha);
+                result.potential_energy += excl_energy;
+                for (f, fe) in result.forces.iter_mut().zip(excl_forces.iter()) {
+                    f[0] += fe[0];
+                    f[1] += fe[1];
+                    f[2] += fe[2];
+                }
             }
             result
         }

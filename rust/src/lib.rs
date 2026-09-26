@@ -21,7 +21,7 @@ use constraints::{build_constraints_with_algorithm, ConstraintAlgorithm};
 use integrator::{md_step, parse_barostat, parse_thermostat, Barostat, MdState, Restraint};
 use minimize::minimize;
 use forces::{backend_from_env, compute_forces};
-use electrostatics::ewald_energy_correction;
+use electrostatics::ewald_energy_correction_for_cutoff;
 use pdb::PdbFilePy;
 use topology::{SimulationBox, Topology, TopologyPy};
 use trajectory::{
@@ -104,7 +104,7 @@ fn topology_energy(path: &str) -> PyResult<f64> {
     let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     let backend = backend_from_env();
     let result = compute_forces(&top, 1.0, backend);
-    Ok(result.potential_energy + ewald_energy_correction(&top))
+    Ok(result.potential_energy + ewald_energy_correction_for_cutoff(&top, 1.0))
 }
 
 #[pyfunction]

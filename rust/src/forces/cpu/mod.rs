@@ -185,6 +185,15 @@ pub fn compute_nonbonded_forces(
             fi[2] += fp[2];
         }
         potential_energy += pme_result.energy;
+
+        let (excl_energy, excl_forces, _excl_virial) =
+            crate::electrostatics::excluded_pair_correction(topology, ctx.alpha);
+        potential_energy += excl_energy;
+        for (fi, fe) in forces.iter_mut().zip(excl_forces.iter()) {
+            fi[0] += fe[0];
+            fi[1] += fe[1];
+            fi[2] += fe[2];
+        }
     }
 
     ForceResult {
@@ -332,8 +341,22 @@ pub fn compute_nonbonded_virial(topology: &Topology, cutoff: f64) -> f64 {
 
 /// Total scalar virial W = sum r_ij . f_ij used for pressure:
 /// P = (2*KE + W) / (3*V).
+///
+/// When the system is periodic (and not using the implicit-solvent GB
+/// path), this includes the PME reciprocal-space virial
+/// (W_recip = -3V dE_recip/dV at fixed fractional coordinates) and the
+/// excluded/1-4 pair correction's virial, so pressure stays correct with
+/// PME electrostatics.
 pub fn compute_virial(topology: &Topology, cutoff: f64) -> f64 {
-    compute_bonded_virial(topology) + compute_nonbonded_virial(topology, cutoff)
+    let mut virial = compute_bonded_virial(topology) + compute_nonbonded_virial(topology, cutoff);
+    if topology.box_.pbc && !topology.is_implicit_gb() {
+        let ctx = PmeContext::new(topology, cutoff);
+        let pme_result = pme::compute_pme_forces(topology, &ctx);
+        virial += pme_result.virial;
+        let (_, _, excl_virial) = crate::electrostatics::excluded_pair_correction(topology, ctx.alpha);
+        virial += excl_virial;
+    }
+    virial
 }
 
 fn build_14_pairs(topology: &Topology) -> std::collections::HashSet<(usize, usize)> {

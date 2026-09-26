@@ -1,4 +1,4 @@
-use crate::electrostatics::ewald_energy_correction;
+use crate::electrostatics::ewald_energy_correction_for_cutoff;
 use crate::forces::{backend_from_env, compute_forces};
 use crate::topology::Topology;
 
@@ -21,7 +21,7 @@ pub fn minimize(
 
     for step in 0..max_steps {
         let result = compute_forces(&topology, cutoff, backend.clone());
-        final_energy = result.potential_energy + ewald_energy_correction(&topology);
+        final_energy = result.potential_energy + ewald_energy_correction_for_cutoff(&topology, cutoff);
         iterations = step + 1;
 
         let max_force = result
