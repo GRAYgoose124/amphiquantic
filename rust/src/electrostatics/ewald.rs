@@ -31,11 +31,12 @@ pub fn screened_coulomb_energy_force(
     let arg = alpha * r;
     let erfc_val = erfc(arg);
     let energy = pref * erfc_val / r;
-    let force_scalar = pref * (erfc_val / r2 + 2.0 * alpha * (-arg * arg).exp() / (std::f64::consts::PI.sqrt() * r));
+    // Returned force scalar is |F|/r, to be multiplied by the separation vector.
+    let force_scalar = pref * (erfc_val / r + 2.0 * alpha * (-arg * arg).exp() / std::f64::consts::PI.sqrt()) / r2;
     (energy, force_scalar)
 }
 
 pub fn direct_coulomb_energy_force(qi: f64, qj: f64, r: f64, r2: f64, scale: f64) -> (f64, f64) {
     let pref = 138.935456 * scale * qi * qj;
-    (pref / r, pref / r2)
+    (pref / r, pref / (r2 * r))
 }

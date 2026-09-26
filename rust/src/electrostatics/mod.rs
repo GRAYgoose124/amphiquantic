@@ -106,7 +106,7 @@ pub fn excluded_pair_correction(
         // force_scalar = -dE/dr, matching the sign convention used by
         // `ewald::screened_coulomb_energy_force` / `direct_coulomb_energy_force`.
         let derf_dr = (2.0 * alpha / std::f64::consts::PI.sqrt()) * (-arg * arg).exp();
-        let force_scalar = pref * (derf_dr / r - erf_val / r2);
+        let force_scalar = pref * (derf_dr / r - erf_val / r2) / r;
         for k in 0..3 {
             forces[i][k] -= force_scalar * dr[k];
             forces[j][k] += force_scalar * dr[k];

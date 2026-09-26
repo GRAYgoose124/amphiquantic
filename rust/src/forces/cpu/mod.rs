@@ -232,7 +232,7 @@ pub fn compute_nonbonded_forces(
                 let sr = sigma / r;
                 let sr6 = sr.powi(6);
                 let sr12 = sr6 * sr6;
-                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r2;
                 let lj_energy = 4.0 * epsilon * (sr12 - sr6);
                 *energy += lj_energy;
                 for k in 0..3 {
@@ -312,7 +312,7 @@ pub fn compute_lj_forces(topology: &Topology, cutoff: f64) -> ForceResult {
                 let sr = sigma / r;
                 let sr6 = sr.powi(6);
                 let sr12 = sr6 * sr6;
-                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r2;
                 let lj_energy = 4.0 * epsilon * (sr12 - sr6);
                 *energy += lj_energy;
                 for k in 0..3 {
@@ -403,7 +403,7 @@ pub fn compute_nonbonded_virial(topology: &Topology, cutoff: f64) -> f64 {
                 let sr = sigma / r;
                 let sr6 = sr.powi(6);
                 let sr12 = sr6 * sr6;
-                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+                let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r2;
                 v += lj_force_scalar * r2;
             }
 
@@ -595,6 +595,38 @@ mod tests {
         }
         top.build_exclusions();
         top
+    }
+
+    /// Total CPU forces (bonded + LJ + Coulomb, with and without PME) must
+    /// equal -dE/dx by central finite differences. Guards the pair-force
+    /// convention: every force scalar is |F|/r, multiplied by the separation
+    /// vector.
+    #[test]
+    fn total_forces_match_finite_difference() {
+        let top = random_solvated_topology(40, 7);
+        let cutoff = 1.0;
+        let ctx = PmeContext::new(&top, cutoff);
+        for pme in [None, Some(&ctx)] {
+            let energy = |t: &Topology| compute_forces_with_pme(t, cutoff, pme).potential_energy;
+            let analytic = compute_forces_with_pme(&top, cutoff, pme).forces;
+            let h = 1e-6;
+            for &a in &[0usize, 1, 2, 30, 61, 119] {
+                for k in 0..3 {
+                    let mut tp = top.clone();
+                    tp.atoms[a].position[k] += h;
+                    let mut tm = top.clone();
+                    tm.atoms[a].position[k] -= h;
+                    let fd = -(energy(&tp) - energy(&tm)) / (2.0 * h);
+                    let f = analytic[a][k];
+                    let tol = 1e-4 * f.abs().max(1.0);
+                    assert!(
+                        (fd - f).abs() < tol,
+                        "pme={} atom {a} comp {k}: analytic {f} vs fd {fd}",
+                        pme.is_some()
+                    );
+                }
+            }
+        }
     }
 
     /// Parallel (rayon, default thread pool) nonbonded + bonded forces must
