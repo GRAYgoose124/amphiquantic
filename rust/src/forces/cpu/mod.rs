@@ -37,13 +37,10 @@ const PARALLEL_MIN_ITEMS: usize = 1024;
 fn take_force_buffer(n_atoms: usize) -> Vec<[f64; 3]> {
     FORCE_BUFFER_POOL.with(|pool| {
         if let Some(mut buf) = pool.borrow_mut().pop() {
-            if buf.len() != n_atoms {
-                buf.resize(n_atoms, [0.0; 3]);
-            } else {
-                for v in buf.iter_mut() {
-                    *v = [0.0; 3];
-                }
-            }
+            // clear() before resize: a pooled buffer from a differently
+            // sized system must not leak stale forces into the new one.
+            buf.clear();
+            buf.resize(n_atoms, [0.0; 3]);
             buf
         } else {
             vec![[0.0f64; 3]; n_atoms]
@@ -637,6 +634,7 @@ mod tests {
     /// speedup (CI machines vary in core count), just prints the measured
     /// number for visibility, and sanity-checks it's not a slowdown.
     #[test]
+    #[ignore = "wall-clock benchmark; run with --ignored"]
     fn benchmark_parallel_speedup_vs_single_thread() {
         let top = random_solvated_topology(600, 7);
         let cutoff = 1.0;
@@ -677,6 +675,7 @@ mod tests {
     /// scale this crate's performance target (>=2.5x speedup at N~5000 on 4
     /// threads) is stated for.
     #[test]
+    #[ignore = "wall-clock benchmark; run with --ignored"]
     fn benchmark_parallel_speedup_at_5000_atoms() {
         let top = random_solvated_topology(1666, 13);
         let cutoff = 1.0;
