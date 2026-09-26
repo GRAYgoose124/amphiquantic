@@ -22,6 +22,7 @@ struct SimParams {
     max_per_atom_excl: u32,
     num_bonds: u32,
     num_angles: u32,
+    num_dihedrals: u32,
     box_lx: f32,
     box_ly: f32,
     box_lz: f32,
@@ -55,12 +56,18 @@ const MAX_EXCL: u32 = 8u;
 @group(1) @binding(6) var<storage, read_write> ref_positions: array<vec4<f32>>;
 @group(1) @binding(7) var<storage, read_write> max_disp: array<atomic<u32>>; // bitcast f32, 1 element
 @group(1) @binding(8) var<storage, read_write> ke_accum: array<atomic<i32>>; // fixed point, 1 element
-@group(1) @binding(9) var<storage, read_write> external_force: array<vec4<f32>>; // CPU-side dihedral/PME contribution
+@group(1) @binding(9) var<storage, read_write> external_force: array<vec4<f32>>; // CPU-side PME contribution
+@group(1) @binding(10) var<storage, read_write> nb_energy: array<f32>; // per-atom, 0.5*sum(pair energy) so summing over atoms gives the total
 
 @group(2) @binding(0) var<storage, read> bond_idx: array<vec2<u32>>;
 @group(2) @binding(1) var<storage, read> bond_params: array<vec2<f32>>; // r0, k
 @group(2) @binding(2) var<storage, read> angle_idx: array<vec4<u32>>; // i, j, k, pad
 @group(2) @binding(3) var<storage, read> angle_params: array<vec2<f32>>; // theta0(rad), k
+@group(2) @binding(4) var<storage, read> dihedral_idx: array<vec4<u32>>; // i, j, k, l
+@group(2) @binding(5) var<storage, read> dihedral_params: array<vec4<f32>>; // k_phi, n, delta, pad
+@group(2) @binding(6) var<storage, read_write> bond_energy: array<f32>;
+@group(2) @binding(7) var<storage, read_write> angle_energy: array<f32>;
+@group(2) @binding(8) var<storage, read_write> dihedral_energy: array<f32>;
 
 fn erfc_approx(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.5 * abs(x));
@@ -192,6 +199,7 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ci = cell_of(pi);
 
     var facc = vec3<f32>(0.0, 0.0, 0.0);
+    var eacc = 0.0;
 
     for (var dz = -1; dz <= 1; dz = dz + 1) {
         for (var dy = -1; dy <= 1; dy = dy + 1) {
@@ -231,6 +239,7 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let sr6 = pow(sr, 6.0);
                         let sr12 = sr6 * sr6;
                         fscalar += 24.0 * epsilon * (2.0 * sr12 - sr6) / r2;
+                        eacc += 0.5 * 4.0 * epsilon * (sr12 - sr6);
                     }
                     if (sim.alpha > 0.0) {
                         let ar = sim.alpha * r;
@@ -239,9 +248,11 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let qq = sim.coulomb * qi * qj;
                         let e_deriv = qq * (erfc_v / r + (2.0 * sim.alpha / sqrt(3.14159265) ) * expfac) / r2;
                         fscalar += e_deriv;
+                        eacc += 0.5 * qq * erfc_v / r;
                     } else {
                         let qq = sim.coulomb * qi * qj;
                         fscalar += qq / (r2 * r);
+                        eacc += 0.5 * qq / r;
                     }
                     facc -= fscalar * dr;
                 }
@@ -249,6 +260,7 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     add_force_fp(i, facc);
+    nb_energy[i] = eacc;
 }
 
 // ---- bonded ----
@@ -263,10 +275,12 @@ fn bond_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = p.y;
     let dr = mic(positions[idx.y].xyz - positions[idx.x].xyz);
     let r = max(length(dr), 1e-8);
-    let fscalar = -2.0 * k * (r - r0) / r;
+    let dr_mag = r - r0;
+    let fscalar = -2.0 * k * dr_mag / r;
     let f = fscalar * dr;
     add_force_fp(idx.x, -f);
     add_force_fp(idx.y, f);
+    bond_energy[b] = k * dr_mag * dr_mag;
 }
 
 @compute @workgroup_size(64)
@@ -285,7 +299,8 @@ fn angle_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     cos_t = clamp(cos_t, -1.0, 1.0);
     let theta = acos(cos_t);
     let sin_t = max(sqrt(1.0 - cos_t * cos_t), 1e-6);
-    let dvdt = 2.0 * k * (theta - theta0);
+    let dtheta = theta - theta0;
+    let dvdt = 2.0 * k * dtheta;
     let coef = -dvdt / sin_t;
 
     let fi = coef * (rkj / (lij * lkj) - cos_t * rij / (lij * lij));
@@ -294,6 +309,59 @@ fn angle_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
     add_force_fp(idx.x, fi);
     add_force_fp(idx.y, fj);
     add_force_fp(idx.z, fk);
+    angle_energy[a] = k * dtheta * dtheta;
+}
+
+// ---- dihedrals (proper + improper periodic torsions; the CPU reference,
+// `cpu::add_dihedral_forces`, chains propers and impropers into one list and
+// uses the same functional form for both, so a single kernel below covers
+// both, exactly matching the CPU math term-for-term). ----
+
+@compute @workgroup_size(64)
+fn dihedral_forces(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = gid.x;
+    if (d >= sim.num_dihedrals) { return; }
+    let idx = dihedral_idx[d];
+    let p = dihedral_params[d];
+    let k_phi = p.x;
+    let n = p.y;
+    let delta = p.z;
+
+    let pi = positions[idx.x].xyz;
+    let pj = positions[idx.y].xyz;
+    let pk = positions[idx.z].xyz;
+    let pl = positions[idx.w].xyz;
+
+    let b1 = pj - pi;
+    let b2 = pk - pj;
+    let b3 = pl - pk;
+
+    let n2 = cross(b1, b2);
+    let n3 = cross(b2, b3);
+    let len_b2 = max(length(b2), 1e-12);
+    let m1 = cross(n2, b2 / len_b2);
+
+    let x = dot(n2, n3);
+    let y = dot(m1, n3);
+    let phi = atan2(y, x);
+    let angle_term = n * phi - delta;
+    let e = k_phi * (1.0 + cos(angle_term));
+    dihedral_energy[d] = e;
+
+    let d_e_d_phi = k_phi * n * sin(angle_term);
+    let inv_n2 = 1.0 / max(length(n2), 1e-12);
+    let inv_n3 = 1.0 / max(length(n3), 1e-12);
+
+    let f_i = n2 * (-d_e_d_phi * len_b2 * inv_n2);
+    let f_l = n3 * (d_e_d_phi * len_b2 * inv_n3);
+    let b2dot = max(dot(b2, b2), 1e-12);
+    let f_j = f_i * (-1.0 + dot(b3, b2) / b2dot);
+    let f_k = f_l * (-1.0 + dot(b1, b2) / b2dot);
+
+    add_force_fp(idx.x, f_i);
+    add_force_fp(idx.y, f_j);
+    add_force_fp(idx.z, f_k);
+    add_force_fp(idx.w, f_l);
 }
 
 // ---- convert / clear ----

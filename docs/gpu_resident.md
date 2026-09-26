@@ -29,8 +29,32 @@ Per MD step, entirely on the GPU:
   both write into the same per-atom force without races or accumulation-order
   sensitivity — this is the same idea as OpenMM's mixed-precision fixed-point
   accumulators, at `i32` rather than `i64` scope for simplicity.
-- Bonded harmonic bond and angle kernels (`bond_forces`, `angle_forces`),
-  also accumulating into the fixed-point buffer.
+- Bonded harmonic bond, angle and periodic-torsion dihedral kernels
+  (`bond_forces`, `angle_forces`, `dihedral_forces`), also accumulating into
+  the fixed-point buffer. `dihedral_forces` covers both proper and improper
+  torsions (they're chained into one dispatch, matching how
+  `cpu::add_dihedral_forces` treats them identically) and is a direct WGSL
+  port of that CPU function's math — same intermediate cross products
+  (`n2`, `n3`, `m1`), same `atan2`-based dihedral angle, same
+  `f_i`/`f_j`/`f_k`/`f_l` force redistribution.
+- GPU potential-energy reduction: the `bond_forces`, `angle_forces`,
+  `dihedral_forces` and `nonbonded` kernels each also write their
+  contribution to a per-item (`bond_energy`/`angle_energy`/
+  `dihedral_energy`, one `f32` per bond/angle/dihedral) or per-atom
+  (`nb_energy`, one `f32` per atom, each atom's slot holding half the sum of
+  its pairwise LJ+real-space-Ewald energies so summing over atoms double-
+  counts correctly) buffer on every dispatch — the extra ALU cost is
+  negligible next to the force math already being done. `potential_energy_gpu()`
+  reads these four buffers back and sums them in `f64` on the host, and is
+  only called on output steps (`GpuResidentEngine::run`'s
+  `output_interval` cadence), not every step. This is a **per-item/per-atom
+  readback**, not a from-scratch workgroup-shared-memory partial-sum
+  reduction — a documented simplification in the spirit of the cell-list
+  prefix-scan simplification below: the buffers are already the size of the
+  system (comparable to the position/velocity readbacks the engine already
+  does), so this isn't a new bottleneck, but it doesn't get a true
+  logarithmic on-GPU reduction. Virial/pressure reduction is not yet part of
+  this (tracked as a follow-up; see "What stays on the CPU").
 - Velocity-Verlet integration (`kick_half`, `drift`, `kick_half` again),
   kinetic-energy reduction (`ke_reduce`), and thermostat velocity scaling
   (`scale_velocities`).
@@ -50,10 +74,9 @@ Per MD step, entirely on the GPU:
   CPU thread, then reconciling) is a natural follow-up once the two are
   running as separate submissions instead of the current per-step
   request/response readback.
-- **Dihedral/improper bonded terms** are likewise evaluated on the CPU each
-  step (`cpu::compute_dihedral_forces`, a new function factored out of the
-  existing `compute_bonded_forces` so it doesn't double-count bonds/angles
-  already done on the GPU) and folded in the same way as PME.
+- **Dihedral/improper bonded terms** are now evaluated on the GPU (see
+  "What's actually resident" above) — this was previously a per-step CPU
+  round trip (`cpu::compute_dihedral_forces`) and is no longer.
 - **SETTLE** (rigid 3-site water) is applied via the existing, validated
   `constraints::apply_settle_analytic` / `apply_settle_velocity` CPU
   routines, once per step, on a position/velocity readback — rather than a
@@ -73,6 +96,19 @@ Per MD step, entirely on the GPU:
   Correct for the same reason the CPU/GPU per-pair backends' exclusion lists
   are (bonded exclusion lists are tiny), but doesn't get the SIMD-friendly
   bitmask-test property a real tile-bitmask design would.
+- **1-4 (dihedral end-atom) LJ/Coulomb scaling**: the CPU nonbonded path
+  (`cpu::compute_nonbonded_forces`) applies `LJ_14_SCALE`/`COULOMB_14_SCALE`
+  to the `(i, l)` pair of every dihedral (they're nonbonded-interacting, not
+  excluded, just scaled). The GPU-resident `nonbonded` kernel does not — it
+  only checks the exclusion list, so a 1-4 pair that isn't also a 1-2/1-3
+  exclusion gets full-strength LJ/Coulomb instead of the scaled value. This
+  is a real, pre-existing correctness gap for any topology whose dihedral
+  end-atoms are also within the nonbonded cutoff (the test topologies added
+  for the dihedral-kernel and energy-reduction parity tests below sidestep
+  it by using zero charge/epsilon, isolating the bonded-kernel math being
+  tested). Fixing it means uploading a per-atom (or per-pair) 1-4 partner
+  table to the `nonbonded` kernel the same way exclusions are uploaded;
+  tracked as follow-up work, not fixed in this change.
 - **Prefix scan**: the exclusive scan over per-cell atom counts (needed to
   turn per-cell counts into per-cell start offsets for the counting-sort
   scatter) is done by reading the small `cell_count` buffer back to the host,
@@ -86,38 +122,39 @@ Per MD step, entirely on the GPU:
   Gaussian noise for a true BAOAB Langevin O-step. The `thermostat="langevin"`
   path here is a velocity-rescaling approximation, not full BAOAB; treat it
   as a placeholder until a real per-atom counter-based RNG kernel lands.
-- **Energy accounting**: the "GPU-resident" run loop reports (in
-  `GpuResidentReport`/the CSV energy log) the kinetic energy from the GPU
-  reduction, and the potential energy from the CPU-computed
-  dihedral+PME/exclusion-correction terms only — the GPU-computed
-  bond/angle/nonbonded potential energy is **not currently reduced and
-  reported** (only the forces are used). A GPU potential-energy reduction
-  kernel analogous to `ke_reduce` is the natural next step; until then,
-  `total_energy`/drift-based diagnostics from this backend undercount the
-  true potential energy and should not be compared directly against the
-  `hybrid`/`cpu` backends' energy logs.
+- **Energy accounting**: the "GPU-resident" run loop now reports (in
+  `GpuResidentReport`/the CSV energy log, at `output_interval` cadence) the
+  full potential energy: the GPU-reduced bond + angle + dihedral + LJ +
+  real-space-Coulomb energy (`potential_energy_gpu()`) plus the CPU-computed
+  PME reciprocal-space energy, its self/background correction, and the
+  excluded-pair real-space subtraction PME requires (folded in via the same
+  `compute_cpu_extra` closure that supplies the CPU-side force
+  contribution). This is now directly comparable to the `hybrid`/`cpu`
+  backends' energy logs for a given topology (see
+  `potential_energy_matches_cpu_reference`, a non-periodic parity test
+  against `cpu::compute_forces_with_pme`, <1e-4 relative). Virial/pressure
+  reduction on the GPU is not yet implemented (kinetic + potential energy
+  only); a scalar pressure readout for this backend is a follow-up.
 - **Trajectory writing**: `simulate_topology_gpu_resident` only writes a
   single trajectory frame (the final structure) rather than a frame per
   `output_interval` like `simulate_topology` does — the run loop doesn't
   stream intermediate structures back to the host today, only energy
   samples.
 
-## A note on an unrelated pre-existing observation
+## A note on a since-fixed pre-existing observation
 
-While writing a GPU-vs-CPU parity test for the new nonbonded kernel, the two
-independent, already-shipped GPU kernels (`forces.wgsl`'s per-pair kernel,
-used by the `gpu`/`hybrid` backends) and the standard closed-form LJ vector
-force (`F_i = 24ε(2(σ/r)^12 − (σ/r)^6) / r² · r_ij`) agree with each other and
-with this new kernel — but `cpu::compute_nonbonded_forces` /
-`cpu::compute_lj_forces` multiply their (already `1/r`-scaled)
-`lj_force_scalar` by the **unnormalized** separation vector `dr` (magnitude
-`r`) instead of a unit vector, which looks like a pre-existing factor-of-`r`
-normalization discrepancy in the plain CPU path, unrelated to this change.
-It was not touched here (out of scope, high blast radius); the new
-GPU-resident parity test (`nonbonded_lj_matches_cpu_reference`, despite its
-name — see its comments) is checked against the closed-form reference and
-the existing GPU kernel's convention instead, to avoid inheriting a possibly
-wrong answer. This is worth a dedicated follow-up investigation.
+An earlier version of this document flagged an apparent factor-of-`r`
+normalization discrepancy in `cpu::compute_nonbonded_forces` /
+`cpu::compute_lj_forces` (their pair-force scalars were being multiplied by
+the unnormalized separation vector `dr`, magnitude `r`, instead of being
+pre-divided by `r`) and, as a workaround, checked the GPU-resident
+nonbonded parity test against an independent closed-form reference instead
+of the CPU path directly. That CPU bug has since been fixed ("Fix CPU
+nonbonded pair forces off by a factor of r", finite-difference-verified via
+`total_forces_match_finite_difference`), so the workaround is gone:
+`nonbonded_lj_matches_cpu_reference`, `dihedral_forces_match_cpu_reference`
+and `potential_energy_matches_cpu_reference` all compare directly against
+`cpu::compute_forces_with_pme` now.
 
 ## Precision model
 
@@ -178,13 +215,22 @@ uv run pytest -m gpu tests/validation/test_gpu_resident.py -v
 
 This is how the GPU-resident code in this change was actually exercised
 (see the PR/task notes): every kernel above — cell list build, tiled
-nonbonded LJ+Ewald with fixed-point atomics, bonded kernels, velocity-Verlet
+nonbonded LJ+Ewald with fixed-point atomics, bond/angle/dihedral kernels,
+the per-item/per-atom potential-energy reduction, velocity-Verlet
 integration, max-displacement rebuild trigger, KE reduction, V-rescale
-scaling — ran and produced correct results on `llvmpipe` (a software CPU
-rasterizer/compute implementation), not just compiled. It is much slower
-than real GPU hardware and is a correctness check, not a performance one;
-the owner should re-run the benchmark on real hardware to get meaningful
-`ns/day` numbers.
+scaling — ran and produced correct results on `lavapipe`/`llvmpipe` (Mesa's
+software Vulkan/CPU compute implementation), not just compiled. The Phase 1
+dihedral-kernel and energy-reduction work specifically added
+`dihedral_forces_match_cpu_reference` and
+`potential_energy_matches_cpu_reference` (both passing on lavapipe, <1e-4
+relative error against `cpu::compute_forces_with_pme`), alongside the
+existing `nonbonded_lj_matches_cpu_reference` (now also compared directly
+against the CPU path — see the note above), `bond_forces_match_cpu_reference`
+and `nve_energy_drift_bounded_over_1000_steps`; `uv run pytest -m gpu` also
+ran green on the same lavapipe adapter. It is much slower than real GPU
+hardware and is a correctness check, not a performance one; the owner
+should re-run the benchmark on real hardware to get meaningful `ns/day`
+numbers.
 
 ## CLI
 

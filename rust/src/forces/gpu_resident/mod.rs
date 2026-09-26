@@ -12,9 +12,9 @@
 //! existing validated CPU implementation rather than a new WGSL kernel).
 
 use crate::constraints::{apply_settle_analytic, apply_settle_velocity, build_constraints, ConstraintSet};
+use crate::electrostatics::excluded_pair_correction;
 use crate::electrostatics::ewald_energy_correction_with_alpha;
 use crate::electrostatics::pme::{compute_pme_forces, PmeContext};
-use crate::forces::cpu::compute_dihedral_forces;
 use crate::topology::Topology;
 use bytemuck::{Pod, Zeroable};
 use pollster;
@@ -34,6 +34,7 @@ struct SimParamsGpu {
     max_per_atom_excl: u32,
     num_bonds: u32,
     num_angles: u32,
+    num_dihedrals: u32,
     box_lx: f32,
     box_ly: f32,
     box_lz: f32,
@@ -99,10 +100,16 @@ struct Buffers {
     max_disp: wgpu::Buffer,
     ke_accum: wgpu::Buffer,
     external_force: wgpu::Buffer,
+    nb_energy: wgpu::Buffer,
     bond_idx: wgpu::Buffer,
     bond_params: wgpu::Buffer,
     angle_idx: wgpu::Buffer,
     angle_params: wgpu::Buffer,
+    dihedral_idx: wgpu::Buffer,
+    dihedral_params: wgpu::Buffer,
+    bond_energy: wgpu::Buffer,
+    angle_energy: wgpu::Buffer,
+    dihedral_energy: wgpu::Buffer,
     scale_uniform: wgpu::Buffer,
     read_pos: wgpu::Buffer,
     read_vel: wgpu::Buffer,
@@ -119,6 +126,7 @@ pub struct GpuResidentEngine {
     n: usize,
     num_bonds: usize,
     num_angles: usize,
+    num_dihedrals: usize,
     cells: (u32, u32, u32),
     num_cells: u32,
     cutoff: f64,
@@ -147,6 +155,7 @@ struct Pipelines {
     nonbonded: wgpu::ComputePipeline,
     bond_forces: wgpu::ComputePipeline,
     angle_forces: wgpu::ComputePipeline,
+    dihedral_forces: wgpu::ComputePipeline,
     convert_forces: wgpu::ComputePipeline,
     add_external_forces: wgpu::ComputePipeline,
     kick_half: wgpu::ComputePipeline,
@@ -246,6 +255,7 @@ impl GpuResidentEngine {
                 storage_entry(7, false),
                 storage_entry(8, false),
                 storage_entry(9, false),
+                storage_entry(10, false),
             ],
         });
         let layout2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -255,6 +265,11 @@ impl GpuResidentEngine {
                 storage_entry(1, true),
                 storage_entry(2, true),
                 storage_entry(3, true),
+                storage_entry(4, true),
+                storage_entry(5, true),
+                storage_entry(6, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
             ],
         });
         let layout3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -290,6 +305,7 @@ impl GpuResidentEngine {
             nonbonded: make_pipeline!("nonbonded"),
             bond_forces: make_pipeline!("bond_forces"),
             angle_forces: make_pipeline!("angle_forces"),
+            dihedral_forces: make_pipeline!("dihedral_forces"),
             convert_forces: make_pipeline!("convert_forces"),
             add_external_forces: make_pipeline!("add_external_forces"),
             kick_half: make_pipeline!("kick_half"),
@@ -362,6 +378,7 @@ impl GpuResidentEngine {
                 wgpu::BindGroupEntry { binding: 7, resource: buf.max_disp.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: buf.ke_accum.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: buf.external_force.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: buf.nb_energy.as_entire_binding() },
             ],
         });
         let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -372,6 +389,11 @@ impl GpuResidentEngine {
                 wgpu::BindGroupEntry { binding: 1, resource: buf.bond_params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: buf.angle_idx.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: buf.angle_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: buf.dihedral_idx.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: buf.dihedral_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: buf.bond_energy.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: buf.angle_energy.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: buf.dihedral_energy.as_entire_binding() },
             ],
         });
         let bg3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -386,6 +408,7 @@ impl GpuResidentEngine {
             n,
             num_bonds: topology.bonds.len(),
             num_angles: topology.angles.len(),
+            num_dihedrals: topology.dihedrals.len() + topology.impropers.len(),
             cells,
             num_cells,
             cutoff,
@@ -419,6 +442,7 @@ impl GpuResidentEngine {
             max_per_atom_excl: MAX_EXCL as u32,
             num_bonds: self.num_bonds as u32,
             num_angles: self.num_angles as u32,
+            num_dihedrals: self.num_dihedrals as u32,
             box_lx: self.box_dims[0] as f32,
             box_ly: self.box_dims[1] as f32,
             box_lz: self.box_dims[2] as f32,
@@ -503,8 +527,58 @@ impl GpuResidentEngine {
         if self.num_angles > 0 {
             groups.push((&self.pipelines.angle_forces, dispatch_1d(self.num_angles as u32)));
         }
+        if self.num_dihedrals > 0 {
+            groups.push((&self.pipelines.dihedral_forces, dispatch_1d(self.num_dihedrals as u32)));
+        }
         groups.push((&self.pipelines.convert_forces, dispatch_1d(self.n as u32)));
         self.encode_and_submit(&groups);
+    }
+
+    /// Sums the GPU-computed bond + angle + dihedral + nonbonded (LJ +
+    /// real-space Ewald) potential energy via a per-item/per-atom readback
+    /// (a documented simplification of a full workgroup-shared-memory
+    /// reduction — see docs/gpu_resident.md). Only called on output steps;
+    /// the energy values themselves are written by every
+    /// `compute_nonbonded_and_bonded()` dispatch (negligible extra ALU
+    /// cost), so this adds one readback, not one dispatch.
+    fn potential_energy_gpu(&self) -> f64 {
+        let mut total = 0.0f64;
+        if self.num_bonds > 0 {
+            total += self
+                .read_f32_buffer(&self.buf.bond_energy, self.num_bonds)
+                .iter()
+                .map(|&e| e as f64)
+                .sum::<f64>();
+        }
+        if self.num_angles > 0 {
+            total += self
+                .read_f32_buffer(&self.buf.angle_energy, self.num_angles)
+                .iter()
+                .map(|&e| e as f64)
+                .sum::<f64>();
+        }
+        if self.num_dihedrals > 0 {
+            total += self
+                .read_f32_buffer(&self.buf.dihedral_energy, self.num_dihedrals)
+                .iter()
+                .map(|&e| e as f64)
+                .sum::<f64>();
+        }
+        if self.n > 0 {
+            total += self
+                .read_f32_buffer(&self.buf.nb_energy, self.n)
+                .iter()
+                .map(|&e| e as f64)
+                .sum::<f64>();
+        }
+        total
+    }
+
+    fn read_f32_buffer(&self, buf: &wgpu::Buffer, len: usize) -> Vec<f32> {
+        self.read_u32_buffer(buf, len)
+            .into_iter()
+            .map(f32::from_bits)
+            .collect()
     }
 
     fn add_external_forces(&self, forces: &[[f64; 3]]) {
@@ -625,7 +699,6 @@ impl GpuResidentEngine {
     ) -> GpuResidentRunResult {
         self.write_sim_params(dt);
         let skin = 0.2f64.max(self.cutoff * 0.1);
-        let has_dihedrals = !topology.dihedrals.is_empty() || !topology.impropers.is_empty();
         let needs_pme = self.pbc;
         let constraints = build_constraints(topology);
         let has_water_constraints = !constraints.waters.is_empty();
@@ -635,6 +708,13 @@ impl GpuResidentEngine {
         let n = self.n;
         let cutoff = self.cutoff;
 
+        // Dihedrals/impropers are now evaluated by the `dihedral_forces` WGSL
+        // kernel inside `compute_nonbonded_and_bonded()` (see
+        // docs/gpu_resident.md); this closure only folds in what's still
+        // CPU-side: the PME reciprocal-space sum, its self/background energy
+        // correction, and the excluded-pair real-space subtraction that PME
+        // requires (the CPU `hybrid`/`cpu` backends apply the same
+        // correction via `compute_nonbonded_forces`).
         let compute_cpu_extra = |positions: &[[f64; 3]]| -> (Vec<[f64; 3]>, f64) {
             let mut top = topology.clone();
             for (a, p) in top.atoms.iter_mut().zip(positions.iter()) {
@@ -642,15 +722,6 @@ impl GpuResidentEngine {
             }
             let mut forces = vec![[0.0f64; 3]; n];
             let mut energy = 0.0;
-            if has_dihedrals {
-                let dih = compute_dihedral_forces(&top);
-                for (f, fd) in forces.iter_mut().zip(dih.forces.iter()) {
-                    f[0] += fd[0];
-                    f[1] += fd[1];
-                    f[2] += fd[2];
-                }
-                energy += dih.potential_energy;
-            }
             if needs_pme {
                 let ctx = PmeContext::new(&top, cutoff);
                 let pme = compute_pme_forces(&top, &ctx);
@@ -660,6 +731,15 @@ impl GpuResidentEngine {
                     f[2] += fp[2];
                 }
                 energy += pme.energy + ewald_energy_correction_with_alpha(&top, ctx.alpha);
+
+                let (excl_energy, excl_forces, _excl_virial) =
+                    excluded_pair_correction(&top, ctx.alpha);
+                energy += excl_energy;
+                for (f, fe) in forces.iter_mut().zip(excl_forces.iter()) {
+                    f[0] += fe[0];
+                    f[1] += fe[1];
+                    f[2] += fe[2];
+                }
             }
             (forces, energy)
         };
@@ -733,8 +813,12 @@ impl GpuResidentEngine {
                 let dof = (3 * self.n).saturating_sub(3).max(1) as f64;
                 const KB: f64 = 0.0019872041;
                 let temperature = 2.0 * ke / (dof * KB);
+                // Full potential energy: GPU-reduced bond/angle/dihedral/LJ/
+                // real-space-Coulomb + the CPU PME reciprocal/exclusion terms
+                // folded in above. Only read back on output steps.
+                let potential_energy = self.potential_energy_gpu() + extra_energy;
                 samples.push(GpuResidentReport {
-                    potential_energy: extra_energy,
+                    potential_energy,
                     kinetic_energy: ke,
                     temperature,
                     step,
@@ -858,13 +942,20 @@ impl Buffers {
         let max_disp = make_storage("max_disp", 16, wgpu::BufferUsages::empty());
         let ke_accum = make_storage("ke_accum", 16, wgpu::BufferUsages::empty());
         let external_force = make_storage("external_force", vec4_size, wgpu::BufferUsages::empty());
+        let nb_energy = make_storage("nb_energy", (n.max(1) * 4) as u64, wgpu::BufferUsages::empty());
 
         let nb = topology.bonds.len().max(1);
         let na = topology.angles.len().max(1);
+        let nd = (topology.dihedrals.len() + topology.impropers.len()).max(1);
         let bond_idx = make_storage("bond_idx", (nb * 8) as u64, wgpu::BufferUsages::empty());
         let bond_params = make_storage("bond_params", (nb * 8) as u64, wgpu::BufferUsages::empty());
         let angle_idx = make_storage("angle_idx", (na * 16) as u64, wgpu::BufferUsages::empty());
         let angle_params = make_storage("angle_params", (na * 8) as u64, wgpu::BufferUsages::empty());
+        let dihedral_idx = make_storage("dihedral_idx", (nd * 16) as u64, wgpu::BufferUsages::empty());
+        let dihedral_params = make_storage("dihedral_params", (nd * 16) as u64, wgpu::BufferUsages::empty());
+        let bond_energy = make_storage("bond_energy", (nb * 4) as u64, wgpu::BufferUsages::empty());
+        let angle_energy = make_storage("angle_energy", (na * 4) as u64, wgpu::BufferUsages::empty());
+        let dihedral_energy = make_storage("dihedral_energy", (nd * 4) as u64, wgpu::BufferUsages::empty());
         let scale_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scale_uniform"),
             size: 16,
@@ -920,10 +1011,16 @@ impl Buffers {
             max_disp,
             ke_accum,
             external_force,
+            nb_energy,
             bond_idx,
             bond_params,
             angle_idx,
             angle_params,
+            dihedral_idx,
+            dihedral_params,
+            bond_energy,
+            angle_energy,
+            dihedral_energy,
             scale_uniform,
             read_pos,
             read_vel,
@@ -996,6 +1093,25 @@ impl GpuResidentEngine {
             self.queue
                 .write_buffer(&self.buf.angle_params, 0, bytemuck::cast_slice(&params));
         }
+        let dihedrals: Vec<&crate::topology::DihedralTerm> = topology
+            .dihedrals
+            .iter()
+            .chain(topology.impropers.iter())
+            .collect();
+        if !dihedrals.is_empty() {
+            let idx: Vec<[u32; 4]> = dihedrals
+                .iter()
+                .map(|d| [d.i as u32, d.j as u32, d.k as u32, d.l as u32])
+                .collect();
+            let params: Vec<[f32; 4]> = dihedrals
+                .iter()
+                .map(|d| [d.k_phi as f32, d.n as f32, d.delta as f32, 0.0])
+                .collect();
+            self.queue
+                .write_buffer(&self.buf.dihedral_idx, 0, bytemuck::cast_slice(&idx));
+            self.queue
+                .write_buffer(&self.buf.dihedral_params, 0, bytemuck::cast_slice(&params));
+        }
     }
 }
 
@@ -1043,7 +1159,7 @@ pub fn run_gpu_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{AtomRecord, BondTerm, SimulationBox, Topology, TopologyMetadata};
+    use crate::topology::{AngleTerm, AtomRecord, BondTerm, DihedralTerm, SimulationBox, Topology, TopologyMetadata};
 
     fn have_gpu_adapter() -> bool {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -1117,31 +1233,120 @@ mod tests {
         let cutoff = 1.0;
         let gpu = gpu_forces_single_eval(&top, cutoff);
 
-        // Reference value from the closed-form LJ force,
-        // F_i = 24*eps*(2*(sigma/r)^12 - (sigma/r)^6) / r^2 * r_ij
-        // (Allen & Tildesley eq. 8.4-ish; equivalent to what the existing
-        // shipped per-pair GPU kernel in forces.wgsl computes via
-        // `lj * normalize(dr)` with `lj = 24 eps (2 sr12 - sr6) / r`).
-        // Note: this disagrees with `cpu::compute_lj_forces` /
-        // `cpu::compute_nonbonded_forces`, which multiply their `lj_force_scalar`
-        // (already `/r`) by the *unnormalized* separation vector `dr` (magnitude
-        // `r`) instead of the unit vector — an apparent pre-existing factor-of-`r`
-        // normalization bug in that CPU path unrelated to this change, flagged
-        // separately rather than fixed here.
-        let sr = sigma / r;
-        let sr6 = sr.powi(6);
-        let sr12 = sr6 * sr6;
-        // r_ij = r_i - r_j = (-r, 0, 0) since atom1 sits at +x from atom0.
-        let expected = 24.0 * epsilon * (2.0 * sr12 - sr6) / (r * r) * (-r);
-        assert!(
-            (gpu[0][0] - expected).abs() < 1e-3,
-            "gpu={:?} expected~{}",
-            gpu[0],
-            expected
-        );
-        assert!(gpu[0][1].abs() < 1e-6 && gpu[0][2].abs() < 1e-6);
+        // Since upgrade-1 fixed the CPU nonbonded pair-force convention
+        // (the `lj_force_scalar`/Coulomb force scalar is `|F|/r`, multiplied
+        // by the *unnormalized* separation vector `dr`, not a unit vector —
+        // see the "Fix CPU nonbonded pair forces off by a factor of r"
+        // commit), the CPU path is finite-difference-verified correct, so
+        // this compares directly against it instead of an independent
+        // closed-form reference.
+        let cpu = crate::forces::cpu::compute_forces_with_pme(&top, cutoff, None);
+        for k in 0..3 {
+            let rel = (gpu[0][k] - cpu.forces[0][k]).abs() / cpu.forces[0][k].abs().max(1e-6);
+            assert!(
+                rel < 1e-3 || (gpu[0][k] - cpu.forces[0][k]).abs() < 1e-3,
+                "axis {k}: gpu={:?} cpu={:?}",
+                gpu[0],
+                cpu.forces[0]
+            );
+        }
         // Newton's third law.
         assert!((gpu[0][0] + gpu[1][0]).abs() < 1e-3);
+    }
+
+    fn chain_topology_no_nonbonded() -> Topology {
+        // A 4-atom chain (bond 0-1-2-3, angles (0,1,2)/(1,2,3), dihedral
+        // (0,1,2,3)) with charge/sigma/epsilon all zero so the GPU
+        // nonbonded kernel contributes exactly zero force/energy. This
+        // isolates the bond+angle+dihedral kernels for parity testing
+        // without also exercising the (separately tracked, pre-existing)
+        // gap that the GPU nonbonded kernel doesn't apply CPU-style 1-4
+        // LJ/Coulomb scaling for dihedral end-atom pairs.
+        let mut top = Topology {
+            version: 1,
+            metadata: TopologyMetadata::default(),
+            box_: SimulationBox { lx: 10.0, ly: 10.0, lz: 10.0, pbc: false },
+            atoms: vec![
+                atom(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0),
+                atom(0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0),
+                atom(0.15, 0.15, 0.0, 0.0, 0.0, 0.0, 12.0),
+                atom(0.30, 0.15, 0.08, 0.0, 0.0, 0.0, 12.0),
+            ],
+            bonds: vec![
+                BondTerm { i: 0, j: 1, k: 300.0, r0: 0.15 },
+                BondTerm { i: 1, j: 2, k: 300.0, r0: 0.15 },
+                BondTerm { i: 2, j: 3, k: 300.0, r0: 0.15 },
+            ],
+            angles: vec![
+                AngleTerm { i: 0, j: 1, k: 2, k_theta: 50.0, theta0: 1.9 },
+                AngleTerm { i: 1, j: 2, k: 3, k_theta: 50.0, theta0: 1.9 },
+            ],
+            dihedrals: vec![DihedralTerm {
+                i: 0,
+                j: 1,
+                k: 2,
+                l: 3,
+                k_phi: 2.0,
+                n: 3,
+                delta: 0.0,
+            }],
+            impropers: vec![],
+            exclusions: vec![],
+        };
+        top.build_exclusions();
+        top
+    }
+
+    /// Dihedral (periodic torsion) forces from the new WGSL kernel must
+    /// match `cpu::compute_forces_with_pme` (which chains propers+impropers
+    /// through the same `add_dihedral_forces` math the kernel was ported
+    /// from) to <1e-4 relative error.
+    #[test]
+    fn dihedral_forces_match_cpu_reference() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let top = chain_topology_no_nonbonded();
+        let cutoff = 1.0;
+        let gpu = gpu_forces_single_eval(&top, cutoff);
+        let cpu = crate::forces::cpu::compute_forces_with_pme(&top, cutoff, None);
+        for atom_idx in 0..4 {
+            for k in 0..3 {
+                let g = gpu[atom_idx][k];
+                let c = cpu.forces[atom_idx][k];
+                let rel = (g - c).abs() / c.abs().max(1e-6);
+                assert!(
+                    rel < 1e-4 || (g - c).abs() < 1e-4,
+                    "atom {atom_idx} axis {k}: gpu={g} cpu={c}"
+                );
+            }
+        }
+    }
+
+    /// The GPU-reduced potential energy (bond + angle + dihedral + LJ +
+    /// real-space Coulomb, summed from the per-item/per-atom energy
+    /// buffers) must match `cpu::compute_forces_with_pme`'s
+    /// `potential_energy` to <1e-4 relative error for a non-periodic system
+    /// (no PME/exclusion-correction terms involved on either side).
+    #[test]
+    fn potential_energy_matches_cpu_reference() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let top = chain_topology_no_nonbonded();
+        let cutoff = 1.0;
+        let engine = GpuResidentEngine::new(&top, cutoff);
+        engine.compute_nonbonded_and_bonded();
+        engine.device.poll(wgpu::Maintain::Wait);
+        let gpu_energy = engine.potential_energy_gpu();
+        let cpu_energy = crate::forces::cpu::compute_forces_with_pme(&top, cutoff, None).potential_energy;
+        let rel = (gpu_energy - cpu_energy).abs() / cpu_energy.abs().max(1e-6);
+        assert!(
+            rel < 1e-4,
+            "gpu_energy={gpu_energy} cpu_energy={cpu_energy} rel={rel}"
+        );
     }
 
     #[test]
