@@ -200,6 +200,25 @@ pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
     }
 }
 
+/// Dihedral + improper terms only (bonds/angles excluded). Used by the
+/// GPU-resident backend, which evaluates bonds/angles on the GPU and only
+/// needs the dihedral contribution folded in from the CPU each step.
+pub fn compute_dihedral_forces(topology: &Topology) -> ForceResult {
+    let n = topology.atoms.len();
+    let dihedrals: Vec<&crate::topology::DihedralTerm> = topology
+        .dihedrals
+        .iter()
+        .chain(topology.impropers.iter())
+        .collect();
+    let (forces, energy) = parallel_accumulate(&dihedrals, n, |dihedral, forces, energy| {
+        add_dihedral_forces(topology, *dihedral, forces, energy);
+    });
+    ForceResult {
+        forces,
+        potential_energy: energy,
+    }
+}
+
 pub fn compute_nonbonded_forces(
     topology: &Topology,
     cutoff: f64,

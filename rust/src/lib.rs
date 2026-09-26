@@ -441,6 +441,92 @@ fn simulate_topology(
     Ok((TopologyPy { inner: top }, last_temp, last_pressure))
 }
 
+/// GPU-resident production MD: positions/velocities/forces stay in GPU
+/// buffers for the whole run (see `forces::gpu_resident`). Supports a
+/// narrower feature set than `simulate_topology` — NVE, Langevin, and
+/// V-rescale only; no barostat, no solute LINCS/SHAKE (h-bonds constraints
+/// use CPU SETTLE for water only). See docs/gpu_resident.md.
+#[pyfunction]
+#[pyo3(signature = (
+    path,
+    output_traj=None,
+    steps=None,
+    temperature=None,
+    dt=None,
+    thermostat=None,
+    tau_t=None,
+    seed=None,
+    energy_log=None,
+    cutoff=None,
+))]
+fn simulate_topology_gpu_resident(
+    path: &str,
+    output_traj: Option<&str>,
+    steps: Option<u64>,
+    temperature: Option<f64>,
+    dt: Option<f64>,
+    thermostat: Option<&str>,
+    tau_t: Option<f64>,
+    seed: Option<u64>,
+    energy_log: Option<&str>,
+    cutoff: Option<f64>,
+) -> PyResult<(TopologyPy, f64)> {
+    let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    let n_steps = steps.unwrap_or(100) as usize;
+    let temp = temperature.unwrap_or(300.0);
+    let dt_val = dt.unwrap_or(0.002);
+    let cutoff_val = cutoff.unwrap_or(1.0);
+    let thermostat_kind = match thermostat.unwrap_or("none") {
+        "none" => forces::gpu_resident::GpuResidentThermostat::None,
+        "vrescale" => forces::gpu_resident::GpuResidentThermostat::VRescale,
+        "langevin" => forces::gpu_resident::GpuResidentThermostat::Langevin,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "gpu-resident backend supports thermostat in {{none, vrescale, langevin}}, got {other}"
+            )))
+        }
+    };
+    let result = forces::gpu_resident::run_gpu_resident(
+        &top,
+        cutoff_val,
+        n_steps,
+        dt_val,
+        thermostat_kind,
+        temp,
+        tau_t.unwrap_or(1.0),
+        seed.unwrap_or(0),
+        10,
+    );
+    if let Some(log_path) = energy_log {
+        let mut log = EnergyLogWriter::new(log_path, false).map_err(pyo3::exceptions::PyIOError::new_err)?;
+        for sample in &result.samples {
+            log.write_row(
+                sample.step as u64,
+                sample.step as f64 * dt_val,
+                sample.potential_energy,
+                sample.kinetic_energy,
+                sample.temperature,
+            )
+            .map_err(pyo3::exceptions::PyIOError::new_err)?;
+        }
+    }
+    let final_temp = result.samples.last().map(|s| s.temperature).unwrap_or(temp);
+    if let Some(traj_path) = output_traj {
+        let mut writer = make_traj_writer(Some(traj_path), None)?;
+        if let Some(w) = writer.as_mut() {
+            let last = result.samples.last();
+            w.write_frame(
+                n_steps as u64,
+                &result.topology,
+                last.map(|s| s.potential_energy).unwrap_or(0.0),
+                last.map(|s| s.kinetic_energy).unwrap_or(0.0),
+            )
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        }
+    }
+    Ok((TopologyPy { inner: result.topology }, final_temp))
+}
+
 #[pyfunction]
 fn read_dcd_trajectory(
     path: &str,
@@ -583,6 +669,7 @@ fn rustquantic(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction_bound!(minimize_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(equilibrate_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(simulate_topology, &m)?)?;
+    m.add_function(wrap_pyfunction_bound!(simulate_topology_gpu_resident, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(read_dcd_trajectory, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(write_checkpoint_file, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(read_checkpoint_file, &m)?)?;
