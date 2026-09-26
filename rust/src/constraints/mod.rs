@@ -451,219 +451,166 @@ pub fn apply_settle_analytic(
     }
 }
 
-/// Analytic rigid-body solve for one water molecule.
-///
-/// We place the exact rigid O-H-H triangle (Miyamoto & Kollman's canonical,
-/// mass-weighted, center-of-mass geometry defined by `ra`/`rb`/`rc`) at the
-/// unconstrained step's new center of mass, oriented by the mass-weighted
-/// optimal rotation (Horn's closed-form quaternion / Kabsch method) that
-/// best fits the unconstrained (uncorrected) triangle. This is a single,
-/// non-iterative, per-water solve — same computational character as
-/// Miyamoto-Kollman SETTLE (exact geometry, O(1) analytic work per water,
-/// trivially parallel over waters) — built from the same canonical
-/// triangle and reached without any SHAKE-style iteration.
+/// Analytic rigid-body solve for one water molecule: the literal
+/// Miyamoto & Kollman (1992) SETTLE algorithm (JCC 13(8), pp. 952-962),
+/// following the canonical-frame / closed-form sin-cos derivation as
+/// implemented in GROMACS `settle.cpp` and OpenMM's
+/// `ReferenceSETTLEAlgorithm::apply`. `reference` gives the atom positions
+/// at the *start* of the step (already on the constraint manifold); the
+/// topology's current positions are the unconstrained new positions. The
+/// correction this produces displaces each atom along the *old* (reference)
+/// bond directions -- the defining property of SETTLE that a best-fit
+/// (Kabsch/Horn) rotation does not have.
 fn settle_one(
     topology: &Topology,
     reference: &[[f64; 3]],
     w: &WaterMolecule,
 ) -> (usize, usize, usize, [f64; 3], [f64; 3], [f64; 3]) {
-    let _ = reference; // geometry only depends on the unconstrained step here
-    let mo = topology.atoms[w.o].mass;
-    let mh = topology.atoms[w.h1].mass;
-    let total_mass = mo + 2.0 * mh;
+    let m0 = topology.atoms[w.o].mass;
+    let m1 = topology.atoms[w.h1].mass;
+    let m2 = topology.atoms[w.h2].mass;
 
-    // Canonical (COM-centered) reference triangle, per Miyamoto-Kollman.
-    let rc = w.rhh / 2.0;
-    let base = (w.roh * w.roh - rc * rc).max(0.0).sqrt();
-    let ra = base * (2.0 * mh / total_mass);
-    let rb = base - ra;
-    let canon = [[ra, 0.0, 0.0], [-rb, rc, 0.0], [-rb, -rc, 0.0]];
+    let apos0 = reference[w.o];
+    let apos1 = reference[w.h1];
+    let apos2 = reference[w.h2];
+    let xp0_new = topology.atoms[w.o].position;
+    let xp1_new = topology.atoms[w.h1].position;
+    let xp2_new = topology.atoms[w.h2].position;
+    let mut xp0 = sub(xp0_new, apos0);
+    let mut xp1 = sub(xp1_new, apos1);
+    let mut xp2 = sub(xp2_new, apos2);
 
-    // b0: unconstrained positions after the free step.
-    let b0 = [
-        topology.atoms[w.o].position,
-        topology.atoms[w.h1].position,
-        topology.atoms[w.h2].position,
-    ];
-    let masses = [mo, mh, mh];
-    let mut com_b0 = [0.0; 3];
-    for k in 0..3 {
-        com_b0[k] =
-            (b0[0][k] * masses[0] + b0[1][k] * masses[1] + b0[2][k] * masses[2]) / total_mass;
-    }
-    let b1 = [
-        sub(b0[0], com_b0),
-        sub(b0[1], com_b0),
-        sub(b0[2], com_b0),
-    ];
+    // --- Step1: A1' ---
+    let xb0 = apos1[0] - apos0[0];
+    let yb0 = apos1[1] - apos0[1];
+    let zb0 = apos1[2] - apos0[2];
+    let xc0 = apos2[0] - apos0[0];
+    let yc0 = apos2[1] - apos0[1];
+    let zc0 = apos2[2] - apos0[2];
 
-    // Mass-weighted cross-covariance H = sum_i m_i * canon_i (x) b1_i.
-    let mut h = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for a in 0..3 {
-            for b in 0..3 {
-                h[a][b] += masses[i] * canon[i][a] * b1[i][b];
-            }
-        }
-    }
+    let inv_total_mass = 1.0 / (m0 + m1 + m2);
+    let xcom = (xp0[0] * m0 + (xb0 + xp1[0]) * m1 + (xc0 + xp2[0]) * m2) * inv_total_mass;
+    let ycom = (xp0[1] * m0 + (yb0 + xp1[1]) * m1 + (yc0 + xp2[1]) * m2) * inv_total_mass;
+    let zcom = (xp0[2] * m0 + (zb0 + xp1[2]) * m1 + (zc0 + xp2[2]) * m2) * inv_total_mass;
 
-    let r = optimal_rotation(&h);
+    let xa1 = xp0[0] - xcom;
+    let ya1 = xp0[1] - ycom;
+    let za1 = xp0[2] - zcom;
+    let xb1 = xb0 + xp1[0] - xcom;
+    let yb1 = yb0 + xp1[1] - ycom;
+    let zb1 = zb0 + xp1[2] - zcom;
+    let xc1 = xc0 + xp2[0] - xcom;
+    let yc1 = yc0 + xp2[1] - ycom;
+    let zc1 = zc0 + xp2[2] - zcom;
 
-    let apply_r = |v: [f64; 3]| -> [f64; 3] {
-        [
-            r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2],
-            r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2],
-            r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2],
-        ]
-    };
+    let xaks_zd = yb0 * zc0 - zb0 * yc0;
+    let yaks_zd = zb0 * xc0 - xb0 * zc0;
+    let zaks_zd = xb0 * yc0 - yb0 * xc0;
+    let xaks_xd = ya1 * zaks_zd - za1 * yaks_zd;
+    let yaks_xd = za1 * xaks_zd - xa1 * zaks_zd;
+    let zaks_xd = xa1 * yaks_zd - ya1 * xaks_zd;
+    let xaks_yd = yaks_zd * zaks_xd - zaks_zd * yaks_xd;
+    let yaks_yd = zaks_zd * xaks_xd - xaks_zd * zaks_xd;
+    let zaks_yd = xaks_zd * yaks_xd - yaks_zd * xaks_xd;
 
-    let po = add(apply_r(canon[0]), com_b0);
-    let ph1 = add(apply_r(canon[1]), com_b0);
-    let ph2 = add(apply_r(canon[2]), com_b0);
+    let axlng = (xaks_xd * xaks_xd + yaks_xd * yaks_xd + zaks_xd * zaks_xd).sqrt();
+    let aylng = (xaks_yd * xaks_yd + yaks_yd * yaks_yd + zaks_yd * zaks_yd).sqrt();
+    let azlng = (xaks_zd * xaks_zd + yaks_zd * yaks_zd + zaks_zd * zaks_zd).sqrt();
+    let trns11 = xaks_xd / axlng;
+    let trns21 = yaks_xd / axlng;
+    let trns31 = zaks_xd / axlng;
+    let trns12 = xaks_yd / aylng;
+    let trns22 = yaks_yd / aylng;
+    let trns32 = zaks_yd / aylng;
+    let trns13 = xaks_zd / azlng;
+    let trns23 = yaks_zd / azlng;
+    let trns33 = zaks_zd / azlng;
+
+    let xb0d = trns11 * xb0 + trns21 * yb0 + trns31 * zb0;
+    let yb0d = trns12 * xb0 + trns22 * yb0 + trns32 * zb0;
+    let xc0d = trns11 * xc0 + trns21 * yc0 + trns31 * zc0;
+    let yc0d = trns12 * xc0 + trns22 * yc0 + trns32 * zc0;
+    let za1d = trns13 * xa1 + trns23 * ya1 + trns33 * za1;
+    let xb1d = trns11 * xb1 + trns21 * yb1 + trns31 * zb1;
+    let yb1d = trns12 * xb1 + trns22 * yb1 + trns32 * zb1;
+    let zb1d = trns13 * xb1 + trns23 * yb1 + trns33 * zb1;
+    let xc1d = trns11 * xc1 + trns21 * yc1 + trns31 * zc1;
+    let yc1d = trns12 * xc1 + trns22 * yc1 + trns32 * zc1;
+    let zc1d = trns13 * xc1 + trns23 * yc1 + trns33 * zc1;
+
+    // --- Step2: A2' ---
+    let rc = 0.5 * w.rhh;
+    let mut rb = (w.roh * w.roh - rc * rc).max(0.0).sqrt();
+    let ra = rb * (m1 + m2) * inv_total_mass;
+    rb -= ra;
+    let sinphi = (za1d / ra).clamp(-1.0, 1.0);
+    let cosphi = (1.0 - sinphi * sinphi).max(0.0).sqrt();
+    let sinpsi = ((zb1d - zc1d) / (2.0 * rc * cosphi)).clamp(-1.0, 1.0);
+    let cospsi = (1.0 - sinpsi * sinpsi).max(0.0).sqrt();
+
+    let ya2d = ra * cosphi;
+    let mut xb2d = -rc * cospsi;
+    let yb2d = -rb * cosphi - rc * sinpsi * sinphi;
+    let yc2d = -rb * cosphi + rc * sinpsi * sinphi;
+    let xb2d2 = xb2d * xb2d;
+    let hh2 = 4.0 * xb2d2 + (yb2d - yc2d) * (yb2d - yc2d) + (zb1d - zc1d) * (zb1d - zc1d);
+    let deltx = 2.0 * xb2d + (4.0 * xb2d2 - hh2 + w.rhh * w.rhh).max(0.0).sqrt();
+    xb2d -= deltx * 0.5;
+
+    // --- Step3: al, be, ga ---
+    let alpha = xb2d * (xb0d - xc0d) + yb0d * yb2d + yc0d * yc2d;
+    let beta = xb2d * (yc0d - yb0d) + xb0d * yb2d + xc0d * yc2d;
+    let gamma = xb0d * yb1d - xb1d * yb0d + xc0d * yc1d - xc1d * yc0d;
+
+    let al2be2 = alpha * alpha + beta * beta;
+    let sintheta = ((alpha * gamma - beta * (al2be2 - gamma * gamma).max(0.0).sqrt()) / al2be2)
+        .clamp(-1.0, 1.0);
+
+    // --- Step4: A3' ---
+    let costheta = (1.0 - sintheta * sintheta).max(0.0).sqrt();
+    let xa3d = -ya2d * sintheta;
+    let ya3d = ya2d * costheta;
+    let za3d = za1d;
+    let xb3d = xb2d * costheta - yb2d * sintheta;
+    let yb3d = xb2d * sintheta + yb2d * costheta;
+    let zb3d = zb1d;
+    let xc3d = -xb2d * costheta - yc2d * sintheta;
+    let yc3d = -xb2d * sintheta + yc2d * costheta;
+    let zc3d = zc1d;
+
+    // --- Step5: A3 ---
+    let xa3 = trns11 * xa3d + trns12 * ya3d + trns13 * za3d;
+    let ya3 = trns21 * xa3d + trns22 * ya3d + trns23 * za3d;
+    let za3 = trns31 * xa3d + trns32 * ya3d + trns33 * za3d;
+    let xb3 = trns11 * xb3d + trns12 * yb3d + trns13 * zb3d;
+    let yb3 = trns21 * xb3d + trns22 * yb3d + trns23 * zb3d;
+    let zb3 = trns31 * xb3d + trns32 * yb3d + trns33 * zb3d;
+    let xc3 = trns11 * xc3d + trns12 * yc3d + trns13 * zc3d;
+    let yc3 = trns21 * xc3d + trns22 * yc3d + trns23 * zc3d;
+    let zc3 = trns31 * xc3d + trns32 * yc3d + trns33 * zc3d;
+
+    xp0 = [xcom + xa3, ycom + ya3, zcom + za3];
+    xp1 = [xcom + xb3 - xb0, ycom + yb3 - yb0, zcom + zb3 - zb0];
+    xp2 = [xcom + xc3 - xc0, ycom + yc3 - yc0, zcom + zc3 - zc0];
+
+    let po = add(xp0, apos0);
+    let ph1 = add(xp1, apos1);
+    let ph2 = add(xp2, apos2);
 
     (w.o, w.h1, w.h2, po, ph1, ph2)
-}
-
-/// Optimal rotation matrix R minimizing sum_i |R*canon_i - target_i|^2
-/// (Horn 1987 closed-form quaternion method / Kabsch algorithm), given the
-/// 3x3 cross-covariance matrix `h = sum_i canon_i (x) target_i`.
-fn optimal_rotation(h: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    // Horn's 4x4 symmetric key matrix built from h.
-    let (h00, h01, h02) = (h[0][0], h[0][1], h[0][2]);
-    let (h10, h11, h12) = (h[1][0], h[1][1], h[1][2]);
-    let (h20, h21, h22) = (h[2][0], h[2][1], h[2][2]);
-    let n = [
-        [
-            h00 + h11 + h22,
-            h12 - h21,
-            h20 - h02,
-            h01 - h10,
-        ],
-        [
-            h12 - h21,
-            h00 - h11 - h22,
-            h01 + h10,
-            h20 + h02,
-        ],
-        [
-            h20 - h02,
-            h01 + h10,
-            -h00 + h11 - h22,
-            h12 + h21,
-        ],
-        [
-            h01 - h10,
-            h20 + h02,
-            h12 + h21,
-            -h00 - h11 + h22,
-        ],
-    ];
-
-    let q = largest_eigenvector_4x4(n);
-    quaternion_to_matrix(q)
-}
-
-/// Largest-eigenvalue eigenvector of a symmetric 4x4 matrix via the cyclic
-/// Jacobi eigenvalue algorithm (converges to machine precision in a
-/// handful of sweeps; fully deterministic).
-fn largest_eigenvector_4x4(mut a: [[f64; 4]; 4]) -> [f64; 4] {
-    let mut v = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    for _ in 0..50 {
-        let mut off = 0.0;
-        for p in 0..4 {
-            for q in (p + 1)..4 {
-                off += a[p][q] * a[p][q];
-            }
-        }
-        if off < 1e-30 {
-            break;
-        }
-        for p in 0..4 {
-            for q in (p + 1)..4 {
-                if a[p][q].abs() < 1e-300 {
-                    continue;
-                }
-                let theta = 0.5 * (a[q][q] - a[p][p]) / a[p][q];
-                let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
-                let t = if theta == 0.0 { 1.0 } else { t };
-                let c = 1.0 / (1.0 + t * t).sqrt();
-                let s = t * c;
-                let app = a[p][p];
-                let aqq = a[q][q];
-                let apq = a[p][q];
-                a[p][p] = app - t * apq;
-                a[q][q] = aqq + t * apq;
-                a[p][q] = 0.0;
-                a[q][p] = 0.0;
-                for i in 0..4 {
-                    if i != p && i != q {
-                        let aip = a[i][p];
-                        let aiq = a[i][q];
-                        a[i][p] = aip - s * (aiq + (s / (1.0 + c)) * aip);
-                        a[p][i] = a[i][p];
-                        a[i][q] = aiq + s * (aip - (s / (1.0 + c)) * aiq);
-                        a[q][i] = a[i][q];
-                    }
-                }
-                for i in 0..4 {
-                    let vip = v[i][p];
-                    let viq = v[i][q];
-                    v[i][p] = vip - s * (viq + (s / (1.0 + c)) * vip);
-                    v[i][q] = viq + s * (vip - (s / (1.0 + c)) * viq);
-                }
-            }
-        }
-    }
-    let mut best = 0;
-    for i in 1..4 {
-        if a[i][i] > a[best][best] {
-            best = i;
-        }
-    }
-    let mut vec = [v[0][best], v[1][best], v[2][best], v[3][best]];
-    let norm = (vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2] + vec[3] * vec[3])
-        .sqrt()
-        .max(1e-300);
-    for x in vec.iter_mut() {
-        *x /= norm;
-    }
-    vec
-}
-
-fn quaternion_to_matrix(q: [f64; 4]) -> [[f64; 3]; 3] {
-    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
-    [
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y - w * z),
-            2.0 * (x * z + w * y),
-        ],
-        [
-            2.0 * (x * y + w * z),
-            1.0 - 2.0 * (x * x + z * z),
-            2.0 * (y * z - w * x),
-        ],
-        [
-            2.0 * (x * z - w * y),
-            2.0 * (y * z + w * x),
-            1.0 - 2.0 * (x * x + y * y),
-        ],
-    ]
 }
 
 fn sub(p: [f64; 3], c: [f64; 3]) -> [f64; 3] {
     [p[0] - c[0], p[1] - c[1], p[2] - c[2]]
 }
 
-/// SETTLE velocity correction: after positions are constrained, recompute
-/// water velocities from the position displacement over the step (the
-/// standard SETTLE velocity update), which is exact and leaves the
-/// velocities orthogonal to each constrained bond to machine precision.
+/// SETTLE velocity constraint (Miyamoto & Kollman's RATTLE-analog): solves
+/// the 3x3 linear system for the along-bond velocity corrections tAB, tBC,
+/// tCA that make the post-constraint velocities satisfy d/dt|r_ij|^2 = 0 for
+/// each of the three rigid-water distance constraints, exactly as in
+/// OpenMM/GROMACS's SETTLE velocity update (this is the general form for
+/// unequal H masses, not the equal-mass simplification in the original
+/// SETTLE paper's appendix B).
 pub fn apply_settle_velocity(
     reference: &[[f64; 3]],
     topology: &Topology,
@@ -671,15 +618,64 @@ pub fn apply_settle_velocity(
     dt: f64,
     constraints: &ConstraintSet,
 ) {
-    if dt.abs() < 1e-15 {
-        return;
-    }
+    let _ = (reference, dt);
     for w in &constraints.waters {
-        for &idx in &[w.o, w.h1, w.h2] {
-            for k in 0..3 {
-                velocities[idx][k] = (topology.atoms[idx].position[k] - reference[idx][k]) / dt;
-            }
+        let apos0 = topology.atoms[w.o].position;
+        let apos1 = topology.atoms[w.h1].position;
+        let apos2 = topology.atoms[w.h2].position;
+        let m_a = topology.atoms[w.o].mass;
+        let m_b = topology.atoms[w.h1].mass;
+        let m_c = topology.atoms[w.h2].mass;
+        let mut v0 = velocities[w.o];
+        let mut v1 = velocities[w.h1];
+        let mut v2 = velocities[w.h2];
+
+        let norm3 = |v: [f64; 3]| -> [f64; 3] {
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-300);
+            [v[0] / n, v[1] / n, v[2] / n]
+        };
+        let e_ab = norm3(sub(apos1, apos0));
+        let e_bc = norm3(sub(apos2, apos1));
+        let e_ca = norm3(sub(apos0, apos2));
+
+        let v_ab = dot(sub(v1, v0), e_ab);
+        let v_bc = dot(sub(v2, v1), e_bc);
+        let v_ca = dot(sub(v0, v2), e_ca);
+
+        let c_a = -dot(e_ab, e_ca);
+        let c_b = -dot(e_ab, e_bc);
+        let c_c = -dot(e_bc, e_ca);
+        let s2a = 1.0 - c_a * c_a;
+        let s2b = 1.0 - c_b * c_b;
+        let s2c = 1.0 - c_c * c_c;
+
+        let mabc_inv = 1.0 / (m_a * m_b * m_c);
+        let denom = (((s2a * m_b + s2b * m_a) * m_c
+            + (s2a * m_b * m_b + 2.0 * (c_a * c_b * c_c + 1.0) * m_a * m_b + s2b * m_a * m_a))
+            * m_c
+            + s2c * m_a * m_b * (m_a + m_b))
+            * mabc_inv;
+        let tab = ((c_b * c_c * m_a - c_a * m_b - c_a * m_c) * v_ca
+            + (c_a * c_c * m_b - c_b * m_c - c_b * m_a) * v_bc
+            + (s2c * m_a * m_a * m_b * m_b * mabc_inv + (m_a + m_b + m_c)) * v_ab)
+            / denom;
+        let tbc = ((c_a * c_b * m_c - c_c * m_b - c_c * m_a) * v_ca
+            + (s2a * m_b * m_b * m_c * m_c * mabc_inv + (m_a + m_b + m_c)) * v_bc
+            + (c_a * c_c * m_b - c_b * m_a - c_b * m_c) * v_ab)
+            / denom;
+        let tca = ((s2b * m_a * m_a * m_c * m_c * mabc_inv + (m_a + m_b + m_c)) * v_ca
+            + (c_a * c_b * m_c - c_c * m_b - c_c * m_a) * v_bc
+            + (c_b * c_c * m_a - c_a * m_b - c_a * m_c) * v_ab)
+            / denom;
+
+        for k in 0..3 {
+            v0[k] += (e_ab[k] * tab - e_ca[k] * tca) / m_a;
+            v1[k] += (e_bc[k] * tbc - e_ab[k] * tab) / m_b;
+            v2[k] += (e_ca[k] * tca - e_bc[k] * tbc) / m_c;
         }
+        velocities[w.o] = v0;
+        velocities[w.h1] = v1;
+        velocities[w.h2] = v2;
     }
 }
 
@@ -927,6 +923,11 @@ mod tests {
 
         let dt = 0.002;
         let mut velocities = vec![[0.0; 3]; 3];
+        for idx in 0..3 {
+            for k in 0..3 {
+                velocities[idx][k] = (moved.atoms[idx].position[k] - reference[idx][k]) / dt;
+            }
+        }
         apply_settle_velocity(&reference, &moved, &mut velocities, dt, &constraints);
 
         let w = &constraints.waters[0];
@@ -1047,6 +1048,221 @@ mod tests {
         for atom in &top.atoms {
             if atom.element == "H" {
                 assert!((atom.mass - 3.024).abs() < 1e-10);
+            }
+        }
+    }
+
+    /// Converged SHAKE (iterated to 1e-12 residual) on the full water
+    /// triangle (O-H1, O-H2, H1-H2), used as an independent reference
+    /// solution: SETTLE and this SHAKE both solve the *same* constrained
+    /// least-squares problem (minimum mass-weighted displacement from the
+    /// unconstrained positions satisfying the three rigid distances), so at
+    /// tight tolerance they must agree to numerical precision.
+    /// Canonical SHAKE (Ryckaert, Ciccotti & Berendsen 1977): the
+    /// correction for each constraint is applied along the *reference*
+    /// (old, pre-step) bond vector -- not the instantaneous one -- which is
+    /// exactly the discretized Euler-Lagrange constraint-force direction
+    /// that Miyamoto-Kollman SETTLE also solves for (in closed form,
+    /// without iteration). Iterated to a 1e-13 residual this is the "true
+    /// constrained solution" against which SETTLE is checked.
+    fn converged_shake_water(
+        positions: &mut [[f64; 3]; 3],
+        reference: &[[f64; 3]; 3],
+        masses: [f64; 3],
+        targets: [(usize, usize, f64); 3],
+    ) {
+        let ref_dr: Vec<[f64; 3]> = targets
+            .iter()
+            .map(|&(i, j, _)| sub(reference[j], reference[i]))
+            .collect();
+        for _ in 0..20_000 {
+            let mut max_err = 0.0f64;
+            for (c, &(i, j, r0)) in targets.iter().enumerate() {
+                let dr_ref = ref_dr[c];
+                let dr_cur = sub(positions[j], positions[i]);
+                let r2_cur = dr_cur[0] * dr_cur[0] + dr_cur[1] * dr_cur[1] + dr_cur[2] * dr_cur[2];
+                let err = r2_cur - r0 * r0;
+                max_err = max_err.max(err.abs() / (2.0 * r0));
+                if err.abs() < 1e-13 {
+                    continue;
+                }
+                let inv_mass = 1.0 / masses[i] + 1.0 / masses[j];
+                let dot_ref_cur = dr_ref[0] * dr_cur[0] + dr_ref[1] * dr_cur[1] + dr_ref[2] * dr_cur[2];
+                let g = err / (2.0 * inv_mass * dot_ref_cur);
+                for k in 0..3 {
+                    let dc = g * dr_ref[k];
+                    positions[i][k] += dc / masses[i];
+                    positions[j][k] -= dc / masses[j];
+                }
+            }
+            if max_err < 1e-13 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn settle_matches_converged_shake() {
+        let top = water_topology();
+        let constraints = build_constraints(&top);
+        let w = &constraints.waters[0];
+        let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
+
+        let mut moved = top.clone();
+        moved.atoms[0].position = [0.0011, -0.0004, 0.0007];
+        moved.atoms[1].position = [0.0968, 0.0032, -0.0011];
+        moved.atoms[2].position = [-0.0271, 0.0895, 0.0021];
+
+        // SETTLE solution.
+        let mut settle_top = moved.clone();
+        apply_settle_analytic(&mut settle_top, &reference, &constraints);
+
+        // Independent converged-SHAKE solution on the same unconstrained
+        // input and the same masses.
+        let masses = [
+            top.atoms[w.o].mass,
+            top.atoms[w.h1].mass,
+            top.atoms[w.h2].mass,
+        ];
+        let mut shake_pos = [
+            moved.atoms[w.o].position,
+            moved.atoms[w.h1].position,
+            moved.atoms[w.h2].position,
+        ];
+        let ref_pos = [reference[w.o], reference[w.h1], reference[w.h2]];
+        converged_shake_water(
+            &mut shake_pos,
+            &ref_pos,
+            masses,
+            [(0, 1, w.roh), (0, 2, w.roh), (1, 2, w.rhh)],
+        );
+
+        let settle_pos = [
+            settle_top.atoms[w.o].position,
+            settle_top.atoms[w.h1].position,
+            settle_top.atoms[w.h2].position,
+        ];
+        for i in 0..3 {
+            for k in 0..3 {
+                assert!(
+                    (settle_pos[i][k] - shake_pos[i][k]).abs() < 1e-8,
+                    "atom {i} axis {k}: settle {} vs shake {}",
+                    settle_pos[i][k],
+                    shake_pos[i][k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settle_conserves_linear_momentum() {
+        let top = water_topology();
+        let constraints = build_constraints(&top);
+        let w = &constraints.waters[0];
+        let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
+
+        let mut moved = top.clone();
+        moved.atoms[0].position = [0.0006, 0.0009, -0.0002];
+        moved.atoms[1].position = [0.0961, -0.0018, 0.0006];
+        moved.atoms[2].position = [-0.0283, 0.0921, -0.0009];
+
+        let dt = 0.002;
+        let mut velocities = vec![[0.0; 3]; 3];
+        for idx in 0..3 {
+            for k in 0..3 {
+                velocities[idx][k] = (moved.atoms[idx].position[k] - reference[idx][k]) / dt;
+            }
+        }
+        let masses = [
+            top.atoms[w.o].mass,
+            top.atoms[w.h1].mass,
+            top.atoms[w.h2].mass,
+        ];
+        let mut p_before = [0.0f64; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                p_before[k] += masses[i] * velocities[i][k];
+            }
+        }
+
+        apply_settle_analytic(&mut moved, &reference, &constraints);
+        apply_settle_velocity(&reference, &moved, &mut velocities, dt, &constraints);
+
+        let mut p_after = [0.0f64; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                p_after[k] += masses[i] * velocities[i][k];
+            }
+        }
+        for k in 0..3 {
+            assert!(
+                (p_before[k] - p_after[k]).abs() < 1e-9,
+                "momentum axis {k}: before {} after {}",
+                p_before[k],
+                p_after[k]
+            );
+        }
+    }
+
+    #[test]
+    fn lincs_matches_converged_shake() {
+        let top = make_ch3([0.0, 0.0, 0.0]);
+        let constraints = build_constraints(&top);
+        assert_eq!(constraints.shake_bonds.len(), 3);
+
+        let mut moved = top.clone();
+        for atom in moved.atoms.iter_mut() {
+            atom.position[0] += 0.0002;
+            atom.position[1] -= 0.00015;
+            atom.position[2] += 0.0001;
+        }
+        moved.atoms[1].position[0] += 0.0004;
+        moved.atoms[2].position[1] -= 0.0003;
+        moved.atoms[3].position[2] += 0.00025;
+
+        let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
+
+        let mut lincs_top = moved.clone();
+        apply_lincs(&mut lincs_top, &reference, &constraints);
+
+        // Independent converged-SHAKE reference on the same unconstrained
+        // input (small, star-shaped cluster: SHAKE's own sequential
+        // relaxation converges here too, driven to 1e-13 residual).
+        let mut shake_top = moved.clone();
+        for _ in 0..20_000 {
+            let mut max_err = 0.0f64;
+            for &(i, j, r0) in &constraints.shake_bonds {
+                let dr = sub(shake_top.atoms[j].position, shake_top.atoms[i].position);
+                let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+                let r = r2.sqrt();
+                let err = r - r0;
+                max_err = max_err.max(err.abs());
+                if err.abs() < 1e-13 {
+                    continue;
+                }
+                let mi = shake_top.atoms[i].mass;
+                let mj = shake_top.atoms[j].mass;
+                let inv_mass = 1.0 / mi + 1.0 / mj;
+                let corr = err / (2.0 * r * inv_mass);
+                for k in 0..3 {
+                    let dc = corr * dr[k];
+                    shake_top.atoms[i].position[k] += dc / mi;
+                    shake_top.atoms[j].position[k] -= dc / mj;
+                }
+            }
+            if max_err < 1e-13 {
+                break;
+            }
+        }
+
+        for i in 0..lincs_top.atoms.len() {
+            for k in 0..3 {
+                let a = lincs_top.atoms[i].position[k];
+                let b = shake_top.atoms[i].position[k];
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "atom {i} axis {k}: lincs {a} vs shake {b}"
+                );
             }
         }
     }
