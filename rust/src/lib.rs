@@ -478,8 +478,9 @@ fn simulate_topology(
 /// GPU-resident production MD: positions/velocities/forces stay in GPU
 /// buffers for the whole run (see `forces::gpu_resident`). Supports a
 /// narrower feature set than `simulate_topology` — NVE, Langevin, and
-/// V-rescale only; no barostat, no solute LINCS/SHAKE (h-bonds constraints
-/// use CPU SETTLE for water only). See docs/gpu_resident.md.
+/// V-rescale thermostats; Berendsen and Monte Carlo barostats (NPT) are
+/// supported; solute H-bond constraints use GPU SHAKE (not LINCS). See
+/// docs/gpu_resident.md.
 #[pyfunction]
 #[pyo3(signature = (
     path,
@@ -492,7 +493,13 @@ fn simulate_topology(
     seed=None,
     energy_log=None,
     cutoff=None,
+    barostat=None,
+    pressure=None,
+    tau_p=None,
+    compressibility=None,
+    mc_interval=None,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn simulate_topology_gpu_resident(
     path: &str,
     output_traj: Option<&str>,
@@ -504,7 +511,12 @@ fn simulate_topology_gpu_resident(
     seed: Option<u64>,
     energy_log: Option<&str>,
     cutoff: Option<f64>,
-) -> PyResult<(TopologyPy, f64)> {
+    barostat: Option<&str>,
+    pressure: Option<f64>,
+    tau_p: Option<f64>,
+    compressibility: Option<f64>,
+    mc_interval: Option<u64>,
+) -> PyResult<(TopologyPy, f64, f64)> {
     let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     let n_steps = steps.unwrap_or(100) as usize;
     let temp = temperature.unwrap_or(300.0);
@@ -520,6 +532,16 @@ fn simulate_topology_gpu_resident(
             )))
         }
     };
+    let barostat_kind = match barostat.unwrap_or("none") {
+        "none" => forces::gpu_resident::GpuResidentBarostat::None,
+        "berendsen" => forces::gpu_resident::GpuResidentBarostat::Berendsen,
+        "montecarlo" | "monte-carlo" | "mc" => forces::gpu_resident::GpuResidentBarostat::MonteCarlo,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "gpu-resident backend supports barostat in {{none, berendsen, montecarlo}}, got {other}"
+            )))
+        }
+    };
     let result = forces::gpu_resident::run_gpu_resident(
         &top,
         cutoff_val,
@@ -530,7 +552,13 @@ fn simulate_topology_gpu_resident(
         tau_t.unwrap_or(1.0),
         seed.unwrap_or(0),
         10,
+        barostat_kind,
+        pressure.unwrap_or(1.0),
+        tau_p.unwrap_or(2.0),
+        compressibility.unwrap_or(4.5e-5),
+        mc_interval.unwrap_or(25) as usize,
     );
+    let final_pressure = result.samples.last().map(|s| s.pressure).unwrap_or(0.0);
     if let Some(log_path) = energy_log {
         let mut log = EnergyLogWriter::new(log_path, false).map_err(pyo3::exceptions::PyIOError::new_err)?;
         for sample in &result.samples {
@@ -558,7 +586,7 @@ fn simulate_topology_gpu_resident(
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
         }
     }
-    Ok((TopologyPy { inner: result.topology }, final_temp))
+    Ok((TopologyPy { inner: result.topology }, final_temp, final_pressure))
 }
 
 #[pyfunction]

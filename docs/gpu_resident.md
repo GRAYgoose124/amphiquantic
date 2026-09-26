@@ -267,12 +267,99 @@ round trip is on its own submission rather than synchronous.
   GPU (see "Constraints" below) — this was previously a per-step CPU round
   trip (`constraints::apply_settle_analytic`/`apply_settle_velocity`) for
   water, and unimplemented at all for solute H-bonds. LINCS specifically
-  (as opposed to SHAKE) and **barostats are still not implemented** in the
-  GPU-resident path (`--backend gpu-resident` refuses `--npt`/`--barostat`
-  at the CLI). Systems needing NPT/a barostat still use `hybrid` (the
-  default) or `cpu`; systems needing solute H-bond constraints can now stay
-  on `gpu-resident` (SHAKE, not LINCS, is used there regardless of
-  `ConstraintAlgorithm`).
+  (as opposed to SHAKE) is still not implemented in the GPU-resident path;
+  systems needing solute H-bond constraints stay on `gpu-resident` fine
+  (SHAKE, not LINCS, is used there regardless of `ConstraintAlgorithm`).
+  **NPT (Berendsen and Monte Carlo barostats) is now implemented** — see
+  "NPT: virial, pressure and barostats" below; `--npt`/`--barostat` are no
+  longer refused on `--backend gpu-resident`.
+
+## NPT: virial, pressure and barostats
+
+`--backend gpu-resident --barostat {berendsen,montecarlo}` (or `--npt` on
+`bin/simulate`, which defaults to Berendsen) is now supported, via
+`GpuResidentEngine::pressure`/`apply_berendsen_barostat_gpu`/
+`apply_mc_barostat_gpu` in `rust/src/forces/gpu_resident/mod.rs`. This is
+implemented with a deliberately different strategy than a from-scratch WGSL
+virial-reduction kernel per force term:
+
+- **Virial/pressure**: rather than adding per-pair/per-bond virial
+  accumulator buffers to every kernel (`nonbonded`, `bond_forces`, the PME
+  gather, the SETTLE/SHAKE correction kernels — a large, bind-group-touching
+  change), `GpuResidentEngine::pressure` reads back the current positions
+  (`snapshot_topology`, one `O(n)` transfer — the same kind of readback the
+  engine already does at `output_interval` cadence) into a CPU `Topology`
+  and calls the exact, already-tested `cpu::compute_virial` (2-body bonded +
+  nonbonded LJ/real-space-Coulomb via the CPU neighbor list, plus, when
+  periodic, the PME reciprocal-space virial from `pme_recip_from_grid` and
+  the excluded/1-4 correction's virial — all bit-for-bit the same formula
+  `integrator::compute_step_forces` uses). Kinetic energy still comes from
+  the GPU KE reduction (`kinetic_energy()`) — only the pairwise/PME virial
+  term is computed on the CPU, and only at the cadence pressure is actually
+  needed (output steps and barostat-attempt steps), never in the per-step
+  integration loop. `pressure_matches_cpu_reference_on_water_snapshot`
+  checks this against the identical formula computed entirely on the CPU
+  (`(2*KE + W) / (3V) * PRESSURE_CONV`) on a periodic water snapshot, to
+  <1% relative. This intentionally does not include the constraint-virial
+  correction term `integrator::compute_constraint_virial` adds mid-step (a
+  further simplification — SETTLE/SHAKE's own kernels don't currently
+  accumulate a virial contribution), so a running trajectory's
+  `GpuResidentReport::pressure` will be a somewhat noisier/biased estimate
+  than the CPU integrator's for tightly constrained (heavily SETTLE'd)
+  systems; it is exact for the same snapshot the CPU path evaluates. A
+  documented follow-up: fold constraint-virial accumulation into the
+  `settle_position`/`shake_correction_pass`/`apply_shake_correction` kernels
+  the way the CPU integrator does after `apply_constraints`.
+- **Berendsen barostat** (`apply_berendsen_barostat_gpu`): a literal port of
+  `integrator::apply_berendsen_barostat` — same `pressure`-based scale
+  factor, same `.clamp(0.98, 1.02)` per-step limit — applied via a position
+  read/atomic-scale/write round trip (not a new WGSL scaling kernel; the
+  round trip only happens once a step and is the same size as the
+  input/output the engine already reads back for logging).
+- **Monte Carlo barostat** (`apply_mc_barostat_gpu`): a literal port of
+  `integrator::apply_mc_barostat` — the same random +/-2% volume move,
+  molecule-COM scaling when the topology carries more than one
+  `molecule_id` (else atomic scaling), and the same Metropolis acceptance
+  criterion `-(dE + p*dV - N*kT*ln(V'/V))/kT`. Per the task's suggested
+  approach, the trial energy before/after the volume move comes from a
+  **GPU energy re-evaluation** (`evaluate_energy_gpu`: a fresh
+  `compute_nonbonded_and_bonded` + `pme_and_exclusion_step` dispatch +
+  `potential_energy_gpu()` readback), not a CPU `compute_forces` call — the
+  MC barostat stays "GPU-resident" for its most expensive step (two full
+  force/energy evaluations per attempt), only the positions/box round-trip
+  through the host. On rejection, positions and box are restored and forces
+  are re-evaluated once more so the (unchanged) state's force buffers stay
+  consistent for the next integration step.
+- **Box updates and the neighbor list**: both barostats update
+  `GpuResidentEngine::box_dims` (the source of truth for the sim-params
+  uniform used by the nonbonded cell stencil and, since `pme_and_exclusion_
+  step` reads `self.box_dims` directly, PME's reciprocal-space box) and
+  force an immediate `rebuild_neighbor_list()`. The neighbor **cell grid**
+  itself (`cells`/`num_cells`, and the buffers sized from it) is fixed at
+  engine construction from the *initial* box/cutoff and is not resized as
+  the box fluctuates — a documented simplification acceptable for the
+  small (a few percent) per-move volume changes both barostats make; a
+  barostat run that drifts the box far from its starting size over a very
+  long run would eventually want a resize, which isn't implemented. The PME
+  grid (`pme_grid`, B-spline order) is likewise kept fixed — "update the
+  reciprocal box, not the grid" — since `pme_recip_from_grid` already takes
+  `box_dims` as a parameter independent of the grid's cell counts.
+- **Where it's plumbed through**: `GpuResidentEngine::run`/`run_gpu_resident`
+  take `barostat: GpuResidentBarostat, target_pressure, tau_p,
+  compressibility, mc_interval` (mirroring `integrator::MdState`'s fields);
+  `simulate_topology_gpu_resident` (PyO3) exposes them as
+  `barostat`/`pressure`/`tau_p`/`compressibility`/`mc_interval` and now
+  returns `(topology, final_temperature, final_pressure)`; `bin/simulate`
+  and `bin/equilibrate` no longer refuse `--npt`/`--barostat` for
+  `--backend gpu-resident`. `GpuResidentRunResult` also carries
+  `mc_attempts`/`mc_accepts` so callers (and
+  `mc_barostat_moves_density_toward_target_with_sane_acceptance`) can check
+  the acceptance ratio is sane.
+- **Not done**: constraint-virial accumulation in the SETTLE/SHAKE kernels
+  (noted above), a from-scratch GPU virial reduction (the CPU-snapshot
+  approach was judged lower-risk and reuses already-tested code, the same
+  tradeoff PME reciprocal-space made), and anisotropic/semi-isotropic box
+  scaling (isotropic only, matching the CPU integrator's `Barostat` enum).
 
 ## Deviations from the "textbook" design (and why)
 
@@ -287,12 +374,14 @@ round trip is on its own submission rather than synchronous.
   scanning it there, and writing `cell_start` back. The number of cells is
   orders of magnitude smaller than the number of atoms, so this is not a
   bottleneck, but it is not a from-scratch GPU Blelloch/Hillis-Steele scan.
-- **Virial/pressure reduction and a GPU barostat are not implemented.**
-  `GpuResidentReport` carries kinetic + potential energy only; there is no
-  GPU-side virial reduction (pair + constraint + PME-reciprocal) and no
-  MC/Berendsen barostat path, so `--npt`/`--barostat` stay refused on
-  `--backend gpu-resident`. This remains the single largest gap against
-  `hybrid`/`cpu`, which both support NPT.
+- **Virial/pressure and barostats are now implemented** (see "NPT: virial,
+  pressure and barostats" above) — `GpuResidentReport` now also carries
+  `pressure`, and `--npt`/`--barostat {berendsen,montecarlo}` work on
+  `--backend gpu-resident`. The virial itself is computed via a CPU-snapshot
+  reuse of `cpu::compute_virial`, not a from-scratch WGSL virial-reduction
+  kernel per force term, and does not (yet) include the constraint-virial
+  correction the CPU integrator adds mid-step — see that section for the
+  detail and the follow-up this leaves.
 - **Energy accounting**: the "GPU-resident" run loop now reports (in
   `GpuResidentReport`/the CSV energy log, at `output_interval` cadence) the
   full potential energy: the GPU-reduced bond + angle + dihedral + LJ +
@@ -472,12 +561,16 @@ numbers.
 bin/simulate topo.aqtop --backend gpu-resident --steps 5000 --dt 0.002 \
     --thermostat vrescale --temperature 300 --energy-log out.csv
 bin/equilibrate topo.aqtop --backend gpu-resident --steps 2000 --thermostat langevin
+bin/simulate topo.aqtop --backend gpu-resident --steps 5000 --dt 0.002 \
+    --thermostat vrescale --temperature 300 --npt --barostat montecarlo --pressure 1.0
 ```
 
-`--backend gpu-resident` on either CLI refuses `--npt`/`--barostat` (and, on
-`equilibrate`, `--restrain`) since those aren't implemented in this backend
+`--backend gpu-resident` on either CLI refuses position restraints on
+`equilibrate` (`--restrain`) since those aren't implemented in this backend
 yet, and only accepts `--thermostat` in `{none, vrescale, langevin}`.
-`--backend {cpu,gpu,hybrid}` just sets `$AMPHI_FORCE_BACKEND` (and
+`--npt`/`--barostat {none, berendsen, montecarlo}` are supported (see "NPT:
+virial, pressure and barostats" above). `--backend {cpu,gpu,hybrid}` just
+sets `$AMPHI_FORCE_BACKEND` (and
 `$AMPHI_HYBRID=0` for non-hybrid) before calling the existing
 `simulate_topology`/`equilibrate_topology`, matching prior behavior when
 `--backend` is omitted entirely.

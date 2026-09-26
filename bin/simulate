@@ -139,22 +139,22 @@ def parse_args():
             "Force evaluation backend (default: hybrid, or $AMPHI_FORCE_BACKEND). "
             "'gpu-resident' keeps positions/velocities/forces resident on the GPU "
             "across steps (see docs/gpu_resident.md) and currently only supports "
-            "--thermostat in {none, vrescale, langevin} with no barostat and no "
-            "solute LINCS/SHAKE constraints."
+            "--thermostat in {none, vrescale, langevin} and no solute LINCS/SHAKE "
+            "constraints; --npt/--barostat {none, berendsen, montecarlo} are "
+            "supported."
         ),
     )
     return parser.parse_args()
 
 
 def _run_gpu_resident(args, path: Path):
-    if args.npt or args.barostat:
-        raise SystemExit("--backend gpu-resident does not support NPT/barostats yet")
     if args.thermostat not in ("none", "vrescale", "langevin"):
         raise SystemExit(
             f"--backend gpu-resident supports --thermostat in {{none, vrescale, langevin}}, got {args.thermostat!r}"
         )
+    barostat = args.barostat or ("berendsen" if args.npt else "none")
     traj = args.trajectory or str(path.with_suffix(".md.aqtrj"))
-    top, final_temperature = simulate_topology_gpu_resident(
+    top, final_temperature, final_pressure = simulate_topology_gpu_resident(
         str(path),
         traj,
         args.steps,
@@ -165,10 +165,18 @@ def _run_gpu_resident(args, path: Path):
         None,
         args.energy_log,
         None,
+        barostat,
+        args.pressure,
+        args.tau_p,
+        None,
+        args.mc_interval,
     )
     out = args.output or str(path.with_suffix(".md.aqtop"))
     top.write(out)
-    print(f"Simulated (gpu-resident) → {out}, trajectory {traj} (final T={final_temperature:.1f} K)")
+    print(
+        f"Simulated (gpu-resident) → {out}, trajectory {traj} "
+        f"(final T={final_temperature:.1f} K, P={final_pressure:.1f} bar)"
+    )
 
 
 if __name__ == "__main__":

@@ -144,23 +144,24 @@ def parse_args():
         help=(
             "Force evaluation backend (default: hybrid, or $AMPHI_FORCE_BACKEND). "
             "'gpu-resident' keeps positions/velocities/forces resident on the GPU "
-            "across steps (see docs/gpu_resident.md); it does not support NPT, "
-            "position restraints, or solute LINCS/SHAKE constraints, and only "
-            "--thermostat in {none, vrescale, langevin}."
+            "across steps (see docs/gpu_resident.md); it does not support "
+            "position restraints or solute LINCS/SHAKE constraints, and only "
+            "--thermostat in {none, vrescale, langevin}. --barostat "
+            "{none, berendsen, montecarlo} is supported."
         ),
     )
     return parser.parse_args()
 
 
 def _run_gpu_resident(args, path: Path):
-    if args.barostat or args.restrain:
-        raise SystemExit("--backend gpu-resident does not support NPT/barostats or restraints yet")
+    if args.restrain:
+        raise SystemExit("--backend gpu-resident does not support position restraints yet")
     if args.thermostat not in ("none", "vrescale", "langevin"):
         raise SystemExit(
             f"--backend gpu-resident supports --thermostat in {{none, vrescale, langevin}}, got {args.thermostat!r}"
         )
     traj = args.trajectory or str(path.with_suffix(".eq.aqtrj"))
-    top, final_temperature = simulate_topology_gpu_resident(
+    top, final_temperature, final_pressure = simulate_topology_gpu_resident(
         str(path),
         traj,
         args.steps,
@@ -171,10 +172,18 @@ def _run_gpu_resident(args, path: Path):
         None,
         args.energy_log,
         None,
+        args.barostat or "none",
+        args.pressure,
+        args.tau_p,
+        None,
+        args.mc_interval,
     )
     out = args.output or str(path.with_suffix(".eq.aqtop"))
     top.write(out)
-    print(f"Equilibrated (gpu-resident) → {out}, trajectory {traj} (final T={final_temperature:.1f} K)")
+    print(
+        f"Equilibrated (gpu-resident) → {out}, trajectory {traj} "
+        f"(final T={final_temperature:.1f} K, P={final_pressure:.1f} bar)"
+    )
 
 
 if __name__ == "__main__":

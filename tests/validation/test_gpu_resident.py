@@ -51,7 +51,7 @@ def test_gpu_resident_nve_runs_and_logs_energy(built_extension, tmp_path):
     top.write(str(path))
     log_path = tmp_path / "gpu_resident_nve.csv"
 
-    _, final_temp = simulate_topology_gpu_resident(
+    _, final_temp, _final_pressure = simulate_topology_gpu_resident(
         str(path),
         None,
         200,
@@ -89,7 +89,7 @@ def test_gpu_resident_vrescale_thermostat_runs(built_extension, tmp_path):
     path = tmp_path / "gpu_resident_nvt.aqtop"
     top.write(str(path))
 
-    _, final_temp = simulate_topology_gpu_resident(
+    _, final_temp, _final_pressure = simulate_topology_gpu_resident(
         str(path),
         None,
         100,
