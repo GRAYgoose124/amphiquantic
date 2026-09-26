@@ -4,7 +4,8 @@
 *.lock
 .venv
 target/*
-.cursor/
+.cursor/*
+!.cursor/skills/
 experiments/
 output/
 *.mdp

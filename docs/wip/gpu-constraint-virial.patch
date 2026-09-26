@@ -1,0 +1,408 @@
+diff --git a/rust/data/shaders/gpu_resident.wgsl b/rust/data/shaders/gpu_resident.wgsl
+index 25fdaf9..5f7b7f8 100644
+--- a/rust/data/shaders/gpu_resident.wgsl
++++ b/rust/data/shaders/gpu_resident.wgsl
+@@ -87,6 +87,16 @@ const COULOMB_14_SCALE: f32 = 1.0 / 1.2;
+ @group(4) @binding(3) var<storage, read> shake_idx: array<vec2<u32>>; // i, j
+ @group(4) @binding(4) var<storage, read> shake_r0: array<f32>;
+ @group(4) @binding(5) var<storage, read_write> pos_correction_fp: array<atomic<i32>>; // 3*num_atoms, fixed point
++// Fixed-point (FP_SCALE) scalar accumulator for the SETTLE/SHAKE constraint
++// virial (W = 0.5 * sum r_ij . f_constraint_ij), matching
++// constraints::compute_constraint_virial's convention. Cleared by
++// `clear_constraint_virial` before the position-constrain dispatches for a
++// step and read back (as a small O(1) scalar, like `ke_accum`/`max_disp`)
++// only when pressure is actually needed.
++@group(4) @binding(6) var<storage, read_write> constraint_virial_fp: array<atomic<i32>>; // 1 element
++// Snapshot of positions immediately before a position-constrain call (i.e.
++// the drifted, unconstrained positions), taken by `snapshot_constraint_pre`.
++@group(4) @binding(7) var<storage, read_write> constraint_pre_positions: array<vec4<f32>>;
+ 
+ // ---- PME (group 5): GPU B-spline charge spreading + force gather; the
+ // forward FFT / influence-function multiply / inverse FFT happens on the
+@@ -635,6 +645,40 @@ fn snapshot_settle_ref(@builtin(global_invocation_id) gid: vec3<u32>) {
+     settle_ref_positions[atom] = positions[atom];
+ }
+ 
++// Snapshot taken immediately before a position-constrain call (SETTLE
++// and/or SHAKE), i.e. the drifted-but-unconstrained positions — the "pre"
++// side of the constraint-virial formula `f = m*(post-pre)/dt^2`.
++@compute @workgroup_size(64)
++fn snapshot_constraint_pre(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let atom = gid.x;
++    if (atom >= sim.num_atoms) { return; }
++    constraint_pre_positions[atom] = positions[atom];
++}
++
++@compute @workgroup_size(1)
++fn clear_constraint_virial() {
++    atomicStore(&constraint_virial_fp[0], 0);
++}
++
++fn add_constraint_virial_fp(v: f32) {
++    atomicAdd(&constraint_virial_fp[0], i32(v * FP_SCALE));
++}
++
++// One pair's contribution to `constraints::compute_constraint_virial`:
++// `f_i = m_i*(post_i-pre_i)/dt^2`, accumulated for both `accumulate(i,j)`
++// and `accumulate(j,i)` (i.e. `dot(post_i-post_j, f_i) + dot(post_j-post_i,
++// f_j)`), scaled by the CPU function's trailing `0.5`.
++fn constraint_pair_virial(
++    post_i: vec3<f32>, pre_i: vec3<f32>, m_i: f32,
++    post_j: vec3<f32>, pre_j: vec3<f32>, m_j: f32,
++    inv_dt2: f32,
++) -> f32 {
++    let f_i = m_i * (post_i - pre_i) * inv_dt2;
++    let f_j = m_j * (post_j - pre_j) * inv_dt2;
++    let raw = dot(post_i - post_j, f_i) + dot(post_j - post_i, f_j);
++    return 0.5 * raw;
++}
++
+ fn atom_mass(atom: u32) -> f32 {
+     return 1.0 / max(atom_params[atom].w, 1e-12);
+ }
+@@ -754,9 +798,23 @@ fn settle_position(@builtin(global_invocation_id) gid: vec3<u32>) {
+     xp1 = com + b3 - b0;
+     xp2 = com + c3 - c0;
+ 
+-    positions[o] = vec4<f32>(xp0 + apos0, 0.0);
+-    positions[h1] = vec4<f32>(xp1 + apos1, 0.0);
+-    positions[h2] = vec4<f32>(xp2 + apos2, 0.0);
++    let post0 = xp0 + apos0;
++    let post1 = xp1 + apos1;
++    let post2 = xp2 + apos2;
++    positions[o] = vec4<f32>(post0, 0.0);
++    positions[h1] = vec4<f32>(post1, 0.0);
++    positions[h2] = vec4<f32>(post2, 0.0);
++
++    // Constraint virial: pre-constraint positions are whatever this thread
++    // read at entry (`xp0_new`/`xp1_new`/`xp2_new`, i.e.
++    // `constraint_pre_positions` for these three atoms, snapshotted by
++    // `snapshot_constraint_pre` right after the drift this corrects).
++    let inv_dt2 = 1.0 / max(sim.dt * sim.dt, 1e-20);
++    var wv = 0.0;
++    wv += constraint_pair_virial(post0, xp0_new, m0, post1, xp1_new, m1, inv_dt2);
++    wv += constraint_pair_virial(post0, xp0_new, m0, post2, xp2_new, m2, inv_dt2);
++    wv += constraint_pair_virial(post1, xp1_new, m1, post2, xp2_new, m2, inv_dt2);
++    add_constraint_virial_fp(wv);
+ }
+ 
+ // One thread per water molecule; literal port of
+@@ -868,6 +926,30 @@ fn apply_shake_correction(@builtin(global_invocation_id) gid: vec3<u32>) {
+     atomicStore(&pos_correction_fp[atom * 3u + 2u], 0);
+ }
+ 
++// Constraint-virial contribution from solute H-bond SHAKE constraints,
++// dispatched once after the Jacobi correction/apply loop has fully run
++// (`GpuResidentEngine::apply_position_constraints`), using
++// `constraint_pre_positions` (snapshotted before the loop started) vs. the
++// final corrected `positions` — a single before/after pair per bond,
++// matching `constraints::compute_constraint_virial`'s single-pass
++// convention regardless of how many internal (CPU: Gauss-Seidel to
++// convergence; GPU: fixed-iteration Jacobi) iterations it took.
++@compute @workgroup_size(64)
++fn shake_constraint_virial(@builtin(global_invocation_id) gid: vec3<u32>) {
++    let b = gid.x;
++    if (b >= sim.num_shake_bonds) { return; }
++    let idx = shake_idx[b];
++    let mi = atom_mass(idx.x);
++    let mj = atom_mass(idx.y);
++    let pre_i = constraint_pre_positions[idx.x].xyz;
++    let pre_j = constraint_pre_positions[idx.y].xyz;
++    let post_i = positions[idx.x].xyz;
++    let post_j = positions[idx.y].xyz;
++    let inv_dt2 = 1.0 / max(sim.dt * sim.dt, 1e-20);
++    let wv = constraint_pair_virial(post_i, pre_i, mi, post_j, pre_j, mj, inv_dt2);
++    add_constraint_virial_fp(wv);
++}
++
+ // RATTLE velocity projection for the same solute H-bond constraints
+ // (constraints::apply_rattle's `shake_bonds` loop, literally ported); reuses
+ // `pos_correction_fp` as scratch (cleared by the apply kernel each pass, and
+diff --git a/rust/src/forces/gpu_resident/mod.rs b/rust/src/forces/gpu_resident/mod.rs
+index a1ea852..5859ea8 100644
+--- a/rust/src/forces/gpu_resident/mod.rs
++++ b/rust/src/forces/gpu_resident/mod.rs
+@@ -164,6 +164,8 @@ struct Buffers {
+     shake_idx: wgpu::Buffer,
+     shake_r0: wgpu::Buffer,
+     pos_correction_fp: wgpu::Buffer,
++    constraint_virial_fp: wgpu::Buffer,
++    constraint_pre_positions: wgpu::Buffer,
+     q_grid_fp: wgpu::Buffer,
+     pme_potential_grid: wgpu::Buffer,
+     excl_energy: wgpu::Buffer,
+@@ -262,6 +264,9 @@ struct Pipelines {
+     apply_shake_correction: wgpu::ComputePipeline,
+     shake_velocity_pass: wgpu::ComputePipeline,
+     apply_shake_velocity_correction: wgpu::ComputePipeline,
++    snapshot_constraint_pre: wgpu::ComputePipeline,
++    clear_constraint_virial: wgpu::ComputePipeline,
++    shake_constraint_virial: wgpu::ComputePipeline,
+     pme_clear_grid: wgpu::ComputePipeline,
+     pme_spread: wgpu::ComputePipeline,
+     pme_gather: wgpu::ComputePipeline,
+@@ -397,6 +402,8 @@ impl GpuResidentEngine {
+                 storage_entry(3, true),
+                 storage_entry(4, true),
+                 storage_entry(5, false),
++                storage_entry(6, false),
++                storage_entry(7, false),
+             ],
+         });
+         let layout5 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+@@ -451,6 +458,9 @@ impl GpuResidentEngine {
+             apply_shake_correction: make_pipeline!("apply_shake_correction"),
+             shake_velocity_pass: make_pipeline!("shake_velocity_pass"),
+             apply_shake_velocity_correction: make_pipeline!("apply_shake_velocity_correction"),
++            snapshot_constraint_pre: make_pipeline!("snapshot_constraint_pre"),
++            clear_constraint_virial: make_pipeline!("clear_constraint_virial"),
++            shake_constraint_virial: make_pipeline!("shake_constraint_virial"),
+             pme_clear_grid: make_pipeline!("pme_clear_grid"),
+             pme_spread: make_pipeline!("pme_spread"),
+             pme_gather: make_pipeline!("pme_gather"),
+@@ -579,6 +589,8 @@ impl GpuResidentEngine {
+                 wgpu::BindGroupEntry { binding: 3, resource: buf.shake_idx.as_entire_binding() },
+                 wgpu::BindGroupEntry { binding: 4, resource: buf.shake_r0.as_entire_binding() },
+                 wgpu::BindGroupEntry { binding: 5, resource: buf.pos_correction_fp.as_entire_binding() },
++                wgpu::BindGroupEntry { binding: 6, resource: buf.constraint_virial_fp.as_entire_binding() },
++                wgpu::BindGroupEntry { binding: 7, resource: buf.constraint_pre_positions.as_entire_binding() },
+             ],
+         });
+ 
+@@ -766,7 +778,28 @@ impl GpuResidentEngine {
+     /// manifold (using whatever `settle_ref_positions` currently holds —
+     /// the caller must have snapshotted it, via `snapshot_settle_ref`,
+     /// before the position update this corrects).
++    /// Corrects drifted/unconstrained positions back onto the constraint
++    /// manifold. Also accumulates the constraint virial (`constraint_virial_
++    /// fp`, matching `constraints::compute_constraint_virial`'s convention)
++    /// for this specific call: `clear_constraint_virial` zeroes the
++    /// accumulator, `snapshot_constraint_pre` records the pre-correction
++    /// ("drifted") positions this call started from (needed for SHAKE's
++    /// multi-iteration Jacobi loop; SETTLE's own kernel already has its
++    /// per-water pre-correction positions locally and doesn't need this
++    /// snapshot), `settle_position` accumulates its own per-water
++    /// contribution inline, and `shake_constraint_virial` (dispatched once,
++    /// after all Jacobi iterations settle) accumulates the SHAKE bonds'
++    /// contribution from a single pre/post pair. The accumulator is read
++    /// back (as a small O(1) scalar) only when pressure is actually needed
++    /// — see `GpuResidentEngine::pressure`.
+     fn apply_position_constraints(&self, has_water: bool, has_shake: bool) {
++        if !has_water && !has_shake {
++            return;
++        }
++        self.encode_and_submit(&[
++            (&self.pipelines.clear_constraint_virial, 1),
++            (&self.pipelines.snapshot_constraint_pre, dispatch_1d(self.n as u32)),
++        ]);
+         if has_water {
+             self.encode_and_submit(&[(&self.pipelines.settle_position, dispatch_1d(self.num_waters as u32))]);
+         }
+@@ -777,9 +810,21 @@ impl GpuResidentEngine {
+                     (&self.pipelines.apply_shake_correction, dispatch_1d(self.n as u32)),
+                 ]);
+             }
++            self.encode_and_submit(&[(
++                &self.pipelines.shake_constraint_virial,
++                dispatch_1d(self.num_shake_bonds as u32),
++            )]);
+         }
+     }
+ 
++    /// Reads back the constraint virial accumulated by the most recent
++    /// `apply_position_constraints` call (an O(1) scalar readback, like
++    /// `kinetic_energy()`/`needs_rebuild()`'s `max_disp`).
++    fn constraint_virial(&self) -> f64 {
++        let bits = self.read_u32_buffer(&self.buf.constraint_virial_fp, 1)[0] as i32;
++        bits as f64 / 65536.0
++    }
++
+     /// Projects velocities back onto the constraint manifold's tangent
+     /// space (SETTLE's RATTLE-analog / SHAKE's RATTLE) after a velocity
+     /// change (a kick or the Langevin O-step).
+@@ -1009,7 +1054,19 @@ impl GpuResidentEngine {
+         }
+         let ke = self.kinetic_energy();
+         let snap = self.snapshot_topology(template);
+-        let virial = crate::forces::cpu::compute_virial(&snap, cutoff);
++        // Bonded 2-body + nonbonded LJ/real-Coulomb + PME reciprocal +
++        // exclusion/1-4 correction virial, from a CPU-snapshot reuse of the
++        // exact `integrator::compute_step_forces` formula. This alone
++        // under-counts pressure for constrained (SETTLE/SHAKE) systems —
++        // for rigid water in particular, the constraint virial is a large
++        // fraction of the total, not a minor correction — so it's added
++        // separately below from the GPU-accumulated
++        // `constraint_virial_fp` (see `apply_position_constraints`), the
++        // same two-term split `integrator::velocity_verlet_step` uses
++        // (`compute_virial` at drift time, `+= compute_constraint_virial`
++        // after the constraint solve).
++        let pairwise_and_pme_virial = crate::forces::cpu::compute_virial(&snap, cutoff);
++        let virial = pairwise_and_pme_virial + self.constraint_virial();
+         (2.0 * ke + virial) / (3.0 * volume) * PRESSURE_CONV
+     }
+ 
+@@ -1590,6 +1647,17 @@ impl Buffers {
+         let shake_idx = make_storage("shake_idx", (nsb * 8) as u64, wgpu::BufferUsages::empty());
+         let shake_r0 = make_storage("shake_r0", (nsb * 4) as u64, wgpu::BufferUsages::empty());
+         let pos_correction_fp = make_storage("pos_correction_fp", (n.max(1) * 3 * 4) as u64, wgpu::BufferUsages::empty());
++        // Fixed-point (same `FP_SCALE` as `force_fp`/`ke_accum`) scalar
++        // accumulator for the SETTLE/SHAKE constraint virial
++        // (`W_constraint = 0.5 * sum r_ij . f_constraint_ij`, matching
++        // `constraints::compute_constraint_virial`'s convention exactly),
++        // accumulated by `settle_position`/`shake_correction_pass` +
++        // `apply_shake_correction` from `constraint_pre_positions` (a
++        // snapshot of positions immediately before the position-constrain
++        // call, i.e. the drifted/unconstrained positions) vs. the corrected
++        // positions they write.
++        let constraint_virial_fp = make_storage("constraint_virial_fp", 4, wgpu::BufferUsages::empty());
++        let constraint_pre_positions = make_storage("constraint_pre_positions", vec4_size, wgpu::BufferUsages::empty());
+ 
+         let grid_cells = (pme_grid[0] * pme_grid[1] * pme_grid[2]).max(1);
+         let q_grid_fp = make_storage("q_grid_fp", (grid_cells * 4) as u64, wgpu::BufferUsages::empty());
+@@ -1673,6 +1741,8 @@ impl Buffers {
+             shake_idx,
+             shake_r0,
+             pos_correction_fp,
++            constraint_virial_fp,
++            constraint_pre_positions,
+             q_grid_fp,
+             pme_potential_grid,
+             excl_energy,
+@@ -2251,6 +2321,61 @@ mod tests {
+         assert!((d(0, 2) - roh).abs() < 1e-5);
+     }
+ 
++    /// The GPU-accumulated SETTLE constraint virial (`constraint_virial_fp`,
++    /// written inline by the `settle_position` kernel from its own local
++    /// pre/post positions) must match `constraints::compute_constraint_
++    /// virial` computed on the CPU from the identical pre-constraint
++    /// (drifted) and post-constraint positions, to <1e-3 relative — this is
++    /// the piece `pressure()` was previously missing entirely (a real gap
++    /// for any water system, not a minor one: the constraint virial is a
++    /// large fraction of a rigid-water system's total virial).
++    #[test]
++    fn settle_constraint_virial_matches_cpu_reference() {
++        if !have_gpu_adapter() {
++            eprintln!("skipping: no GPU/Vulkan adapter available");
++            return;
++        }
++        let reference_top = water_topology([0.0, 0.0, 0.0]);
++        let reference: Vec<[f64; 3]> = reference_top.atoms.iter().map(|a| a.position).collect();
++
++        let mut unconstrained_top = reference_top.clone();
++        unconstrained_top.atoms[0].position[0] += 0.008;
++        unconstrained_top.atoms[0].position[1] -= 0.003;
++        unconstrained_top.atoms[1].position[1] -= 0.012;
++        unconstrained_top.atoms[1].position[2] += 0.006;
++        unconstrained_top.atoms[2].position[0] += 0.005;
++        unconstrained_top.atoms[2].position[2] -= 0.009;
++        let unconstrained_positions: Vec<[f64; 3]> =
++            unconstrained_top.atoms.iter().map(|a| a.position).collect();
++
++        let constraints = build_constraints(&reference_top);
++        let dt = 0.001;
++        let mut cpu_top = unconstrained_top.clone();
++        apply_settle_analytic(&mut cpu_top, &reference, &constraints);
++        let cpu_virial =
++            crate::constraints::compute_constraint_virial(&cpu_top, &unconstrained_positions, dt, &constraints);
++
++        let engine = GpuResidentEngine::new(&reference_top, 1.0);
++        engine.write_sim_params(dt);
++        engine.write_positions(&unconstrained_positions);
++        let ref_padded: Vec<[f32; 4]> = reference
++            .iter()
++            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, 0.0])
++            .collect();
++        engine
++            .queue
++            .write_buffer(&engine.buf.settle_ref_positions, 0, bytemuck::cast_slice(&ref_padded));
++        engine.encode_and_submit(&[(&engine.pipelines.settle_position, dispatch_1d(3))]);
++        engine.device.poll(wgpu::Maintain::Wait);
++        let gpu_virial = engine.constraint_virial();
++
++        let rel = (gpu_virial - cpu_virial).abs() / cpu_virial.abs().max(1e-8);
++        assert!(
++            rel < 1e-3,
++            "gpu_virial={gpu_virial} cpu_virial={cpu_virial} rel={rel}"
++        );
++    }
++
+     /// `settle_velocity` must remove the along-bond velocity components for
+     /// all three rigid-water pairs (O-H1, O-H2, H1-H2), matching what
+     /// `constraints::apply_settle_velocity` guarantees on the CPU path.
+@@ -2784,6 +2909,75 @@ mod tests {
+         );
+     }
+ 
++    /// Runs the *same* short trajectory (same topology, same initial
++    /// velocities, V-rescale thermostat, SETTLE-constrained water) on the
++    /// CPU integrator and on `GpuResidentEngine`, and checks the two
++    /// backends' *mean* instantaneous pressure over the run agrees to a few
++    /// percent. This specifically exercises the constraint-virial fix: with
++    /// it, the previously-large SETTLE-virial gap between the two backends'
++    /// pressure closes. The two trajectories are not expected to stay
++    /// bit-identical (independent f64 CPU vs. f32 GPU integration diverges
++    /// chaotically step by step), so this compares the *ensemble mean*
++    /// over many steps, not a single instantaneous snapshot.
++    #[test]
++    fn mean_pressure_matches_cpu_reference_over_short_trajectory() {
++        if !have_gpu_adapter() {
++            eprintln!("skipping: no GPU/Vulkan adapter available");
++            return;
++        }
++        use crate::integrator::{initialize_velocities, md_step, MdState, Thermostat};
++
++        let top = periodic_water_box(2, 1.4);
++        let cutoff = 0.6; // comfortably below half the 1.4 nm box length
++        let dt = 0.0005;
++        let n_steps = 300usize;
++        let temperature = 300.0;
++        let velocities = initialize_velocities(&top, temperature);
++
++        // CPU reference trajectory.
++        std::env::set_var("AMPHI_FORCE_BACKEND", "cpu");
++        std::env::set_var("AMPHI_HYBRID", "0");
++        let mut cpu_state = MdState::new(top.clone(), temperature);
++        cpu_state.velocities = velocities.clone();
++        cpu_state.timestep = dt;
++        cpu_state.thermostat = Thermostat::VRescale;
++        cpu_state.tau_t = 0.5;
++        let mut cpu_pressures = Vec::with_capacity(n_steps);
++        for _ in 0..n_steps {
++            let res = md_step(&mut cpu_state, cutoff);
++            cpu_pressures.push(res.pressure);
++        }
++        let cpu_mean: f64 = cpu_pressures.iter().sum::<f64>() / cpu_pressures.len() as f64;
++
++        // GPU-resident trajectory, same topology/velocities/thermostat.
++        let mut engine = GpuResidentEngine::new(&top, cutoff);
++        engine.write_velocities(&velocities);
++        let result = engine.run(
++            &top,
++            n_steps,
++            dt,
++            GpuResidentThermostat::VRescale,
++            temperature,
++            0.5,
++            1,
++            5,
++            GpuResidentBarostat::None,
++            1.0,
++            2.0,
++            4.5e-5,
++            25,
++        );
++        let gpu_mean: f64 =
++            result.samples.iter().map(|s| s.pressure).sum::<f64>() / result.samples.len() as f64;
++
++        eprintln!("cpu_mean_pressure={cpu_mean} gpu_mean_pressure={gpu_mean}");
++        let rel = (gpu_mean - cpu_mean).abs() / cpu_mean.abs().max(1.0);
++        assert!(
++            rel < 0.05,
++            "mean pressure should agree within a few percent: cpu={cpu_mean} gpu={gpu_mean} rel={rel}"
++        );
++    }
++
+     /// The Monte Carlo barostat, run under a V-rescale thermostat on a small
+     /// periodic water box started ~30% too dilute (density well below the
+     /// 1 bar/300 K target of ~1 g/cm^3 for TIP3P), should on net compress

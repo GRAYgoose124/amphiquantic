@@ -26,7 +26,7 @@ done
 echo "==> amphiquantic agent verify (root: $ROOT)"
 
 echo "==> uv sync"
-uv sync
+uv sync --inexact  # --inexact: keep optional extras (openff, rdkit) installed
 
 echo "==> maturin develop"
 uv run maturin develop --manifest-path rust/Cargo.toml
