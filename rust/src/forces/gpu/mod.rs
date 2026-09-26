@@ -1,4 +1,4 @@
-use crate::forces::cpu::ForceResult;
+use crate::forces::cpu::{build_14_pairs, ForceResult, COULOMB_14_SCALE, LJ_14_SCALE};
 use crate::neighbor::build_neighbor_list;
 use crate::topology::Topology;
 use bytemuck::{Pod, Zeroable};
@@ -45,6 +45,7 @@ struct GpuBufferState {
     coord_buf: wgpu::Buffer,
     param_buf: wgpu::Buffer,
     pair_buf: wgpu::Buffer,
+    pair_scale_buf: wgpu::Buffer,
     force_buf: wgpu::Buffer,
     read_buf: wgpu::Buffer,
     sim_buf: wgpu::Buffer,
@@ -86,6 +87,7 @@ impl GpuForceEngine {
                 storage_entry(2, true),
                 storage_entry(3, true),
                 uniform_entry(4),
+                storage_entry(5, true),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -154,6 +156,25 @@ impl GpuForceEngine {
         }
         let num_pairs = nl.pairs.len() as u32;
 
+        // Dihedral 1-4 pairs get scaled LJ/Coulomb instead of full strength
+        // (matches cpu::compute_nonbonded_forces's LJ_14_SCALE/COULOMB_14_SCALE
+        // convention). Every other pair gets (1.0, 1.0).
+        let pairs_14 = build_14_pairs(topology);
+        let mut pair_scale: Vec<[f32; 2]> = nl
+            .pairs
+            .iter()
+            .map(|&(i, j)| {
+                if pairs_14.contains(&(i.min(j), i.max(j))) {
+                    [LJ_14_SCALE as f32, COULOMB_14_SCALE as f32]
+                } else {
+                    [1.0f32, 1.0f32]
+                }
+            })
+            .collect();
+        if pair_scale.is_empty() {
+            pair_scale = vec![[1.0, 1.0]];
+        }
+
         let sim_params = GpuSimParams {
             num_atoms: n as u32,
             num_pairs,
@@ -175,6 +196,8 @@ impl GpuForceEngine {
             .write_buffer(&state.param_buf, 0, bytemuck::cast_slice(&params));
         self.queue
             .write_buffer(&state.pair_buf, 0, bytemuck::cast_slice(&pair_indices));
+        self.queue
+            .write_buffer(&state.pair_scale_buf, 0, bytemuck::cast_slice(&pair_scale));
         self.queue
             .write_buffer(&state.sim_buf, 0, bytemuck::bytes_of(&sim_params));
 
@@ -200,6 +223,10 @@ impl GpuForceEngine {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: state.sim_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: state.pair_scale_buf.as_entire_binding(),
                 },
             ],
             label: None,
@@ -244,7 +271,12 @@ impl GpuForceEngine {
             let qi = topology.atoms[i].charge;
             let qj = topology.atoms[j].charge;
             let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
-            let epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+            let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+            let mut coulomb_scale = 1.0;
+            if pairs_14.contains(&(i.min(j), i.max(j))) {
+                epsilon *= LJ_14_SCALE;
+                coulomb_scale = COULOMB_14_SCALE;
+            }
             let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
             dr = crate::neighbor::minimum_image(dr, &topology.box_);
             let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
@@ -257,11 +289,11 @@ impl GpuForceEngine {
             }
             if use_screened {
                 let (e, _) = crate::electrostatics::ewald::screened_coulomb_energy_force(
-                    qi, qj, r, r2, alpha, 1.0,
+                    qi, qj, r, r2, alpha, coulomb_scale,
                 );
                 potential_energy += e;
             } else {
-                potential_energy += COULOMB_CONSTANT as f64 * qi * qj / r;
+                potential_energy += COULOMB_CONSTANT as f64 * coulomb_scale * qi * qj / r;
             }
         }
 
@@ -292,6 +324,12 @@ impl GpuBufferState {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let pair_scale_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pair_scale"),
+            size: (max_pairs.max(1) * 2 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let force_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("forces"),
             size: (max_atoms * 16) as u64,
@@ -316,6 +354,7 @@ impl GpuBufferState {
             coord_buf,
             param_buf,
             pair_buf,
+            pair_scale_buf,
             force_buf,
             read_buf,
             sim_buf,

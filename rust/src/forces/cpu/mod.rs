@@ -117,8 +117,8 @@ pub struct ForceResult {
 }
 
 const COULOMB_CONSTANT: f64 = 138.935456;
-const LJ_14_SCALE: f64 = 0.5;
-const COULOMB_14_SCALE: f64 = 1.0 / 1.2;
+pub(crate) const LJ_14_SCALE: f64 = 0.5;
+pub(crate) const COULOMB_14_SCALE: f64 = 1.0 / 1.2;
 
 pub fn compute_bonded_forces(topology: &Topology) -> ForceResult {
     let n = topology.atoms.len();
@@ -459,7 +459,7 @@ pub fn compute_virial(topology: &Topology, cutoff: f64) -> f64 {
     virial
 }
 
-fn build_14_pairs(topology: &Topology) -> std::collections::HashSet<(usize, usize)> {
+pub(crate) fn build_14_pairs(topology: &Topology) -> std::collections::HashSet<(usize, usize)> {
     let mut pairs = std::collections::HashSet::new();
     for d in topology.dihedrals.iter().chain(topology.impropers.iter()) {
         let (a, b) = (d.i.min(d.l), d.i.max(d.l));

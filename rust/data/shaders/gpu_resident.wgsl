@@ -20,9 +20,12 @@ struct SimParams {
     cells_y: u32,
     cells_z: u32,
     max_per_atom_excl: u32,
+    max_per_atom_14: u32,
     num_bonds: u32,
     num_angles: u32,
     num_dihedrals: u32,
+    num_waters: u32,
+    num_shake_bonds: u32,
     box_lx: f32,
     box_ly: f32,
     box_lz: f32,
@@ -39,6 +42,9 @@ struct SimParams {
 
 const FP_SCALE: f32 = 65536.0;
 const MAX_EXCL: u32 = 8u;
+const MAX_14: u32 = 8u;
+const LJ_14_SCALE: f32 = 0.5;
+const COULOMB_14_SCALE: f32 = 1.0 / 1.2;
 
 @group(0) @binding(0) var<storage, read_write> positions: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> velocities: array<vec4<f32>>;
@@ -58,6 +64,7 @@ const MAX_EXCL: u32 = 8u;
 @group(1) @binding(8) var<storage, read_write> ke_accum: array<atomic<i32>>; // fixed point, 1 element
 @group(1) @binding(9) var<storage, read_write> external_force: array<vec4<f32>>; // CPU-side PME contribution
 @group(1) @binding(10) var<storage, read_write> nb_energy: array<f32>; // per-atom, 0.5*sum(pair energy) so summing over atoms gives the total
+@group(1) @binding(11) var<storage, read> pairs14: array<u32>; // MAX_14 per atom, 0xffffffff = empty; dihedral (i,l) 1-4 partners
 
 @group(2) @binding(0) var<storage, read> bond_idx: array<vec2<u32>>;
 @group(2) @binding(1) var<storage, read> bond_params: array<vec2<f32>>; // r0, k
@@ -68,6 +75,14 @@ const MAX_EXCL: u32 = 8u;
 @group(2) @binding(6) var<storage, read_write> bond_energy: array<f32>;
 @group(2) @binding(7) var<storage, read_write> angle_energy: array<f32>;
 @group(2) @binding(8) var<storage, read_write> dihedral_energy: array<f32>;
+
+// ---- constraints (group 4): SETTLE (rigid water) + SHAKE (solute H-bonds) ----
+@group(4) @binding(0) var<storage, read> water_idx: array<vec4<u32>>; // o, h1, h2, pad
+@group(4) @binding(1) var<storage, read> water_params: array<vec2<f32>>; // roh, rhh
+@group(4) @binding(2) var<storage, read_write> settle_ref_positions: array<vec4<f32>>; // snapshotted before kick+drift
+@group(4) @binding(3) var<storage, read> shake_idx: array<vec2<u32>>; // i, j
+@group(4) @binding(4) var<storage, read> shake_r0: array<f32>;
+@group(4) @binding(5) var<storage, read_write> pos_correction_fp: array<atomic<i32>>; // 3*num_atoms, fixed point
 
 fn erfc_approx(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.5 * abs(x));
@@ -188,6 +203,16 @@ fn is_excluded(i: u32, j: u32) -> bool {
     return false;
 }
 
+fn is_14(i: u32, j: u32) -> bool {
+    let base = i * MAX_14;
+    for (var k = 0u; k < sim.max_per_atom_14; k = k + 1u) {
+        let e = pairs14[base + k];
+        if (e == j) { return true; }
+        if (e == 0xffffffffu) { return false; }
+    }
+    return false;
+}
+
 @compute @workgroup_size(64)
 fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -231,10 +256,20 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let sigj = atom_params[j].y;
                     let epsj = atom_params[j].z;
 
+                    // Dihedral 1-4 pairs are nonbonded-interacting but scaled
+                    // (not excluded) — matches cpu::compute_nonbonded_forces's
+                    // LJ_14_SCALE/COULOMB_14_SCALE convention exactly.
+                    var lj_scale = 1.0;
+                    var coul_scale = 1.0;
+                    if (is_14(i, j)) {
+                        lj_scale = LJ_14_SCALE;
+                        coul_scale = COULOMB_14_SCALE;
+                    }
+
                     var fscalar = 0.0;
                     if (sigi > 1e-8 && epsj > 1e-12 && epsi > 1e-12) {
                         let sigma = 0.5 * (sigi + sigj);
-                        let epsilon = sqrt(epsi * epsj);
+                        let epsilon = sqrt(epsi * epsj) * lj_scale;
                         let sr = sigma / r;
                         let sr6 = pow(sr, 6.0);
                         let sr12 = sr6 * sr6;
@@ -245,12 +280,12 @@ fn nonbonded(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let ar = sim.alpha * r;
                         let erfc_v = erfc_approx(ar);
                         let expfac = exp(-ar * ar);
-                        let qq = sim.coulomb * qi * qj;
+                        let qq = sim.coulomb * coul_scale * qi * qj;
                         let e_deriv = qq * (erfc_v / r + (2.0 * sim.alpha / sqrt(3.14159265) ) * expfac) / r2;
                         fscalar += e_deriv;
                         eacc += 0.5 * qq * erfc_v / r;
                     } else {
-                        let qq = sim.coulomb * qi * qj;
+                        let qq = sim.coulomb * coul_scale * qi * qj;
                         fscalar += qq / (r2 * r);
                         eacc += 0.5 * qq / r;
                     }
@@ -434,4 +469,292 @@ fn scale_velocities(@builtin(global_invocation_id) gid: vec3<u32>) {
     let atom = gid.x;
     if (atom >= sim.num_atoms) { return; }
     velocities[atom] = vec4<f32>(velocities[atom].xyz * scale_u.scale, 0.0);
+}
+
+// ---- constraints: SETTLE (literal Miyamoto-Kollman, ported from
+// constraints::settle_one / constraints::apply_settle_velocity) + SHAKE
+// (Jacobi-parallel iteration of constraints::apply_shake) — no per-step
+// readback: `settle_ref_positions` is snapshotted on-GPU right before the
+// kick+drift that needs constraining, and both position/velocity
+// corrections are applied in place. ----
+
+@compute @workgroup_size(64)
+fn snapshot_settle_ref(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    settle_ref_positions[atom] = positions[atom];
+}
+
+fn atom_mass(atom: u32) -> f32 {
+    return 1.0 / max(atom_params[atom].w, 1e-12);
+}
+
+// One thread per water molecule; literal port of
+// constraints::settle_one's canonical-frame closed-form solve.
+@compute @workgroup_size(64)
+fn settle_position(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x;
+    if (w >= sim.num_waters) { return; }
+    let idx = water_idx[w];
+    let o = idx.x;
+    let h1 = idx.y;
+    let h2 = idx.z;
+    let par = water_params[w];
+    let roh = par.x;
+    let rhh = par.y;
+
+    let m0 = atom_mass(o);
+    let m1 = atom_mass(h1);
+    let m2 = atom_mass(h2);
+
+    let apos0 = settle_ref_positions[o].xyz;
+    let apos1 = settle_ref_positions[h1].xyz;
+    let apos2 = settle_ref_positions[h2].xyz;
+    let xp0_new = positions[o].xyz;
+    let xp1_new = positions[h1].xyz;
+    let xp2_new = positions[h2].xyz;
+    var xp0 = xp0_new - apos0;
+    var xp1 = xp1_new - apos1;
+    var xp2 = xp2_new - apos2;
+
+    // --- Step1: A1' ---
+    let b0 = apos1 - apos0;
+    let c0 = apos2 - apos0;
+    let inv_total_mass = 1.0 / (m0 + m1 + m2);
+
+    let com = (xp0 * m0 + (b0 + xp1) * m1 + (c0 + xp2) * m2) * inv_total_mass;
+
+    let a1 = xp0 - com;
+    let b1 = b0 + xp1 - com;
+    let c1 = c0 + xp2 - com;
+
+    let aks_zd = cross(b0, c0);
+    let aks_xd = cross(a1, aks_zd);
+    let aks_yd = cross(aks_zd, aks_xd);
+
+    let axlng = length(aks_xd);
+    let aylng = length(aks_yd);
+    let azlng = max(length(aks_zd), 1e-20);
+
+    let trns_x = aks_xd / max(axlng, 1e-20);
+    let trns_y = aks_yd / max(aylng, 1e-20);
+    let trns_z = aks_zd / azlng;
+
+    let xb0d = dot(trns_x, b0);
+    let yb0d = dot(trns_y, b0);
+    let xc0d = dot(trns_x, c0);
+    let yc0d = dot(trns_y, c0);
+    let za1d = dot(trns_z, a1);
+    let xb1d = dot(trns_x, b1);
+    let yb1d = dot(trns_y, b1);
+    let zb1d = dot(trns_z, b1);
+    let xc1d = dot(trns_x, c1);
+    let yc1d = dot(trns_y, c1);
+    let zc1d = dot(trns_z, c1);
+
+    // --- Step2: A2' ---
+    let rc = 0.5 * rhh;
+    var rb = sqrt(max(roh * roh - rc * rc, 0.0));
+    let ra = rb * (m1 + m2) * inv_total_mass;
+    rb -= ra;
+    let sinphi = clamp(za1d / ra, -1.0, 1.0);
+    let cosphi = sqrt(max(1.0 - sinphi * sinphi, 0.0));
+    let sinpsi = clamp((zb1d - zc1d) / (2.0 * rc * cosphi), -1.0, 1.0);
+    let cospsi = sqrt(max(1.0 - sinpsi * sinpsi, 0.0));
+
+    let ya2d = ra * cosphi;
+    var xb2d = -rc * cospsi;
+    let yb2d = -rb * cosphi - rc * sinpsi * sinphi;
+    let yc2d = -rb * cosphi + rc * sinpsi * sinphi;
+    let xb2d2 = xb2d * xb2d;
+    let hh2 = 4.0 * xb2d2 + (yb2d - yc2d) * (yb2d - yc2d) + (zb1d - zc1d) * (zb1d - zc1d);
+    let deltx = 2.0 * xb2d + sqrt(max(4.0 * xb2d2 - hh2 + rhh * rhh, 0.0));
+    xb2d -= deltx * 0.5;
+
+    // --- Step3: al, be, ga ---
+    let alpha = xb2d * (xb0d - xc0d) + yb0d * yb2d + yc0d * yc2d;
+    let beta = xb2d * (yc0d - yb0d) + xb0d * yb2d + xc0d * yc2d;
+    let gamma = xb0d * yb1d - xb1d * yb0d + xc0d * yc1d - xc1d * yc0d;
+
+    let al2be2 = alpha * alpha + beta * beta;
+    let sintheta = clamp(
+        (alpha * gamma - beta * sqrt(max(al2be2 - gamma * gamma, 0.0))) / al2be2,
+        -1.0,
+        1.0,
+    );
+
+    // --- Step4: A3' ---
+    let costheta = sqrt(max(1.0 - sintheta * sintheta, 0.0));
+    let xa3d = -ya2d * sintheta;
+    let ya3d = ya2d * costheta;
+    let za3d = za1d;
+    let xb3d = xb2d * costheta - yb2d * sintheta;
+    let yb3d = xb2d * sintheta + yb2d * costheta;
+    let zb3d = zb1d;
+    let xc3d = -xb2d * costheta - yc2d * sintheta;
+    let yc3d = -xb2d * sintheta + yc2d * costheta;
+    let zc3d = zc1d;
+
+    // --- Step5: A3 (rotate back to lab frame) ---
+    let a3 = xa3d * trns_x + ya3d * trns_y + za3d * trns_z;
+    let b3 = xb3d * trns_x + yb3d * trns_y + zb3d * trns_z;
+    let c3 = xc3d * trns_x + yc3d * trns_y + zc3d * trns_z;
+
+    xp0 = com + a3;
+    xp1 = com + b3 - b0;
+    xp2 = com + c3 - c0;
+
+    positions[o] = vec4<f32>(xp0 + apos0, 0.0);
+    positions[h1] = vec4<f32>(xp1 + apos1, 0.0);
+    positions[h2] = vec4<f32>(xp2 + apos2, 0.0);
+}
+
+// One thread per water molecule; literal port of
+// constraints::apply_settle_velocity's RATTLE-analog linear solve.
+@compute @workgroup_size(64)
+fn settle_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x;
+    if (w >= sim.num_waters) { return; }
+    let idx = water_idx[w];
+    let o = idx.x;
+    let h1 = idx.y;
+    let h2 = idx.z;
+
+    let apos0 = positions[o].xyz;
+    let apos1 = positions[h1].xyz;
+    let apos2 = positions[h2].xyz;
+    let m_a = atom_mass(o);
+    let m_b = atom_mass(h1);
+    let m_c = atom_mass(h2);
+    var v0 = velocities[o].xyz;
+    var v1 = velocities[h1].xyz;
+    var v2 = velocities[h2].xyz;
+
+    let e_ab = normalize(apos1 - apos0);
+    let e_bc = normalize(apos2 - apos1);
+    let e_ca = normalize(apos0 - apos2);
+
+    let v_ab = dot(v1 - v0, e_ab);
+    let v_bc = dot(v2 - v1, e_bc);
+    let v_ca = dot(v0 - v2, e_ca);
+
+    let c_a = -dot(e_ab, e_ca);
+    let c_b = -dot(e_ab, e_bc);
+    let c_c = -dot(e_bc, e_ca);
+    let s2a = 1.0 - c_a * c_a;
+    let s2b = 1.0 - c_b * c_b;
+    let s2c = 1.0 - c_c * c_c;
+
+    let mabc_inv = 1.0 / (m_a * m_b * m_c);
+    let denom = (((s2a * m_b + s2b * m_a) * m_c
+        + (s2a * m_b * m_b + 2.0 * (c_a * c_b * c_c + 1.0) * m_a * m_b + s2b * m_a * m_a))
+        * m_c
+        + s2c * m_a * m_b * (m_a + m_b))
+        * mabc_inv;
+    let tab = ((c_b * c_c * m_a - c_a * m_b - c_a * m_c) * v_ca
+        + (c_a * c_c * m_b - c_b * m_c - c_b * m_a) * v_bc
+        + (s2c * m_a * m_a * m_b * m_b * mabc_inv + (m_a + m_b + m_c)) * v_ab)
+        / denom;
+    let tbc = ((c_a * c_b * m_c - c_c * m_b - c_c * m_a) * v_ca
+        + (s2a * m_b * m_b * m_c * m_c * mabc_inv + (m_a + m_b + m_c)) * v_bc
+        + (c_a * c_c * m_b - c_b * m_a - c_b * m_c) * v_ab)
+        / denom;
+    let tca = ((s2b * m_a * m_a * m_c * m_c * mabc_inv + (m_a + m_b + m_c)) * v_ca
+        + (c_a * c_b * m_c - c_c * m_b - c_c * m_a) * v_bc
+        + (c_b * c_c * m_a - c_a * m_b - c_a * m_c) * v_ab)
+        / denom;
+
+    v0 += (e_ab * tab - e_ca * tca) / m_a;
+    v1 += (e_bc * tbc - e_ab * tab) / m_b;
+    v2 += (e_ca * tca - e_bc * tbc) / m_c;
+
+    velocities[o] = vec4<f32>(v0, 0.0);
+    velocities[h1] = vec4<f32>(v1, 0.0);
+    velocities[h2] = vec4<f32>(v2, 0.0);
+}
+
+// ---- SHAKE (Jacobi-parallel) for solute H-bond constraints ----
+// GPU threads run concurrently, unlike the CPU's sequential Gauss-Seidel
+// `apply_shake`, so this is a Jacobi variant: every bond computes its
+// correction from the same snapshot of positions and atomically
+// accumulates a fixed-point delta per atom; a second kernel applies the
+// accumulated deltas and clears the accumulator. The host dispatches this
+// pair a fixed number of times per step (see `GpuResidentEngine::run`)
+// rather than reading back a convergence residual.
+@compute @workgroup_size(64)
+fn shake_correction_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= sim.num_shake_bonds) { return; }
+    let idx = shake_idx[b];
+    let r0 = shake_r0[b];
+    let pi = positions[idx.x].xyz;
+    let pj = positions[idx.y].xyz;
+    let dr = pj - pi;
+    let r = max(length(dr), 1e-12);
+    let err = r - r0;
+    let mi = atom_mass(idx.x);
+    let mj = atom_mass(idx.y);
+    let inv_mass = 1.0 / mi + 1.0 / mj;
+    let corr = err / (2.0 * r * inv_mass);
+    let dc = corr * dr;
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 0u], i32((dc.x / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 1u], i32((dc.y / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 2u], i32((dc.z / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 0u], i32(-(dc.x / mj) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 1u], i32(-(dc.y / mj) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 2u], i32(-(dc.z / mj) * FP_SCALE));
+}
+
+@compute @workgroup_size(64)
+fn apply_shake_correction(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    let dx = f32(atomicLoad(&pos_correction_fp[atom * 3u + 0u])) / FP_SCALE;
+    let dy = f32(atomicLoad(&pos_correction_fp[atom * 3u + 1u])) / FP_SCALE;
+    let dz = f32(atomicLoad(&pos_correction_fp[atom * 3u + 2u])) / FP_SCALE;
+    positions[atom] = positions[atom] + vec4<f32>(dx, dy, dz, 0.0);
+    atomicStore(&pos_correction_fp[atom * 3u + 0u], 0);
+    atomicStore(&pos_correction_fp[atom * 3u + 1u], 0);
+    atomicStore(&pos_correction_fp[atom * 3u + 2u], 0);
+}
+
+// RATTLE velocity projection for the same solute H-bond constraints
+// (constraints::apply_rattle's `shake_bonds` loop, literally ported); reuses
+// `pos_correction_fp` as scratch (cleared by the apply kernel each pass, and
+// never live at the same time as a position-correction pass).
+@compute @workgroup_size(64)
+fn shake_velocity_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gid.x;
+    if (b >= sim.num_shake_bonds) { return; }
+    let idx = shake_idx[b];
+    let pi = positions[idx.x].xyz;
+    let pj = positions[idx.y].xyz;
+    let dr = pj - pi;
+    let r2 = dot(dr, dr);
+    let vi = velocities[idx.x].xyz;
+    let mi = atom_mass(idx.x);
+    let mj = atom_mass(idx.y);
+    let inv_mass = 1.0 / mi + 1.0 / mj;
+    let dot_v = dot(vi, dr);
+    let corr = dot_v / max(r2 * inv_mass, 1e-20);
+    let dc = corr * dr;
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 0u], i32(-(dc.x / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 1u], i32(-(dc.y / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.x * 3u + 2u], i32(-(dc.z / mi) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 0u], i32((dc.x / mj) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 1u], i32((dc.y / mj) * FP_SCALE));
+    atomicAdd(&pos_correction_fp[idx.y * 3u + 2u], i32((dc.z / mj) * FP_SCALE));
+}
+
+@compute @workgroup_size(64)
+fn apply_shake_velocity_correction(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    let dx = f32(atomicLoad(&pos_correction_fp[atom * 3u + 0u])) / FP_SCALE;
+    let dy = f32(atomicLoad(&pos_correction_fp[atom * 3u + 1u])) / FP_SCALE;
+    let dz = f32(atomicLoad(&pos_correction_fp[atom * 3u + 2u])) / FP_SCALE;
+    velocities[atom] = velocities[atom] + vec4<f32>(dx, dy, dz, 0.0);
+    atomicStore(&pos_correction_fp[atom * 3u + 0u], 0);
+    atomicStore(&pos_correction_fp[atom * 3u + 1u], 0);
+    atomicStore(&pos_correction_fp[atom * 3u + 2u], 0);
 }

@@ -22,6 +22,10 @@ struct AtomParams {
 @group(0) @binding(2) var<storage, read> atom_params: array<AtomParams>;
 @group(0) @binding(3) var<storage, read> pairs: array<u32>;
 @group(0) @binding(4) var<uniform> sim: SimulationParams;
+// Per-pair (lj_scale, coulomb_scale): (1,1) normally, (0.5, 1/1.2) for a
+// dihedral 1-4 pair — matches cpu::compute_nonbonded_forces's
+// LJ_14_SCALE/COULOMB_14_SCALE convention exactly.
+@group(0) @binding(5) var<storage, read> pair_scale: array<vec2<f32>>;
 
 const COULOMB: f32 = 138.935456;
 
@@ -70,8 +74,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (i == atom || j == atom) {
             let other = select(j, i, i == atom);
             let pj = atom_params[other];
+            let scale = pair_scale[p];
             let sigma = 0.5 * (pi.sigma + pj.sigma);
-            let epsilon = sqrt(pi.epsilon * pj.epsilon);
+            let epsilon = sqrt(pi.epsilon * pj.epsilon) * scale.x;
             var dr = coords[other].xyz - pos_i;
             dr = mic(dr);
             if (i == atom) {
@@ -83,11 +88,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let sr6 = pow(sr, 6.0);
             let sr12 = sr6 * sr6;
             let lj = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
-            var coulomb = COULOMB * pi.charge * pj.charge / r2;
+            var coulomb = COULOMB * scale.y * pi.charge * pj.charge / r2;
             if (sim.use_screened == 1u) {
                 let arg = sim.alpha * r;
                 let erfc_val = erfc_approx(arg);
-                coulomb = COULOMB * pi.charge * pj.charge * (
+                coulomb = COULOMB * scale.y * pi.charge * pj.charge * (
                     erfc_val / r2 + 2.0 * sim.alpha * exp(-arg * arg) / (sqrt(3.14159265) * r)
                 );
             }

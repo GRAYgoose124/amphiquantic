@@ -11,16 +11,18 @@
 //! Philox-*inspired* rather than bit-exact Philox, SETTLE applied via the
 //! existing validated CPU implementation rather than a new WGSL kernel).
 
-use crate::constraints::{apply_settle_analytic, apply_settle_velocity, build_constraints, ConstraintSet};
+use crate::constraints::{build_constraints, ConstraintSet};
 use crate::electrostatics::excluded_pair_correction;
 use crate::electrostatics::ewald_energy_correction_with_alpha;
 use crate::electrostatics::pme::{compute_pme_forces, PmeContext};
+use crate::forces::cpu::build_14_pairs;
 use crate::topology::Topology;
 use bytemuck::{Pod, Zeroable};
 use pollster;
 use std::collections::HashSet;
 
 const MAX_EXCL: usize = 8;
+const MAX_14: usize = 8;
 const WORKGROUP: u32 = 64;
 
 #[repr(C)]
@@ -32,9 +34,12 @@ struct SimParamsGpu {
     cells_y: u32,
     cells_z: u32,
     max_per_atom_excl: u32,
+    max_per_atom_14: u32,
     num_bonds: u32,
     num_angles: u32,
     num_dihedrals: u32,
+    num_waters: u32,
+    num_shake_bonds: u32,
     box_lx: f32,
     box_ly: f32,
     box_lz: f32,
@@ -101,6 +106,13 @@ struct Buffers {
     ke_accum: wgpu::Buffer,
     external_force: wgpu::Buffer,
     nb_energy: wgpu::Buffer,
+    pairs14: wgpu::Buffer,
+    water_idx: wgpu::Buffer,
+    water_params: wgpu::Buffer,
+    settle_ref_positions: wgpu::Buffer,
+    shake_idx: wgpu::Buffer,
+    shake_r0: wgpu::Buffer,
+    pos_correction_fp: wgpu::Buffer,
     bond_idx: wgpu::Buffer,
     bond_params: wgpu::Buffer,
     angle_idx: wgpu::Buffer,
@@ -127,6 +139,16 @@ pub struct GpuResidentEngine {
     num_bonds: usize,
     num_angles: usize,
     num_dihedrals: usize,
+    num_waters: usize,
+    num_shake_bonds: usize,
+    /// Counts calls to `read_positions()`/`read_velocities()` — the O(n)
+    /// per-atom GPU->CPU transfers that PME reciprocal-space evaluation and
+    /// (pre-Phase-2) SETTLE/dihedral folding used every step. Small,
+    /// constant-size scalar readbacks (the neighbor-rebuild trigger's
+    /// `max_disp`, the cell-list prefix-scan's `cell_count`, per-item energy
+    /// buffers on output steps) are not counted here; see
+    /// docs/gpu_resident.md.
+    readback_count: std::sync::atomic::AtomicU64,
     cells: (u32, u32, u32),
     num_cells: u32,
     cutoff: f64,
@@ -138,12 +160,14 @@ pub struct GpuResidentEngine {
     layout1: wgpu::BindGroupLayout,
     layout2: wgpu::BindGroupLayout,
     layout3: wgpu::BindGroupLayout,
+    layout4: wgpu::BindGroupLayout,
     pipelines: Pipelines,
     buf: Buffers,
     bg0: wgpu::BindGroup,
     bg1: wgpu::BindGroup,
     bg2: wgpu::BindGroup,
     bg3: wgpu::BindGroup,
+    bg4: wgpu::BindGroup,
 }
 
 struct Pipelines {
@@ -162,6 +186,13 @@ struct Pipelines {
     drift: wgpu::ComputePipeline,
     ke_reduce: wgpu::ComputePipeline,
     scale_velocities: wgpu::ComputePipeline,
+    snapshot_settle_ref: wgpu::ComputePipeline,
+    settle_position: wgpu::ComputePipeline,
+    settle_velocity: wgpu::ComputePipeline,
+    shake_correction_pass: wgpu::ComputePipeline,
+    apply_shake_correction: wgpu::ComputePipeline,
+    shake_velocity_pass: wgpu::ComputePipeline,
+    apply_shake_velocity_correction: wgpu::ComputePipeline,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -215,6 +246,10 @@ impl GpuResidentEngine {
         let mut limits = wgpu::Limits::default();
         limits.max_storage_buffers_per_shader_stage =
             adapter_limits.max_storage_buffers_per_shader_stage.min(32).max(8);
+        // A 5th bind group (constraints: SETTLE + SHAKE) is used alongside the
+        // 4 the non-constraint kernels already need; wgpu's conservative
+        // default (4) doesn't have room for it.
+        limits.max_bind_groups = adapter_limits.max_bind_groups.min(8).max(5);
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
@@ -256,6 +291,7 @@ impl GpuResidentEngine {
                 storage_entry(8, false),
                 storage_entry(9, false),
                 storage_entry(10, false),
+                storage_entry(11, true),
             ],
         });
         let layout2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -276,10 +312,21 @@ impl GpuResidentEngine {
             label: Some("gpu_resident_group3"),
             entries: &[uniform_entry(0)],
         });
+        let layout4 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_resident_group4"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                storage_entry(3, true),
+                storage_entry(4, true),
+                storage_entry(5, false),
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_resident_layout"),
-            bind_group_layouts: &[&layout0, &layout1, &layout2, &layout3],
+            bind_group_layouts: &[&layout0, &layout1, &layout2, &layout3, &layout4],
             push_constant_ranges: &[],
         });
 
@@ -312,6 +359,13 @@ impl GpuResidentEngine {
             drift: make_pipeline!("drift"),
             ke_reduce: make_pipeline!("ke_reduce"),
             scale_velocities: make_pipeline!("scale_velocities"),
+            snapshot_settle_ref: make_pipeline!("snapshot_settle_ref"),
+            settle_position: make_pipeline!("settle_position"),
+            settle_velocity: make_pipeline!("settle_velocity"),
+            shake_correction_pass: make_pipeline!("shake_correction_pass"),
+            apply_shake_correction: make_pipeline!("apply_shake_correction"),
+            shake_velocity_pass: make_pipeline!("shake_velocity_pass"),
+            apply_shake_velocity_correction: make_pipeline!("apply_shake_velocity_correction"),
         };
 
         let n = topology.atoms.len();
@@ -379,6 +433,7 @@ impl GpuResidentEngine {
                 wgpu::BindGroupEntry { binding: 8, resource: buf.ke_accum.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: buf.external_force.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: buf.nb_energy.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: buf.pairs14.as_entire_binding() },
             ],
         });
         let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -401,6 +456,20 @@ impl GpuResidentEngine {
             layout: &layout3,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.scale_uniform.as_entire_binding() }],
         });
+        let bg4 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg4"),
+            layout: &layout4,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.water_idx.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buf.water_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: buf.settle_ref_positions.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: buf.shake_idx.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: buf.shake_r0.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: buf.pos_correction_fp.as_entire_binding() },
+            ],
+        });
+
+        let constraints = build_constraints(topology);
 
         let mut engine = Self {
             device,
@@ -409,6 +478,9 @@ impl GpuResidentEngine {
             num_bonds: topology.bonds.len(),
             num_angles: topology.angles.len(),
             num_dihedrals: topology.dihedrals.len() + topology.impropers.len(),
+            num_waters: constraints.waters.len(),
+            num_shake_bonds: constraints.shake_bonds.len(),
+            readback_count: std::sync::atomic::AtomicU64::new(0),
             cells,
             num_cells,
             cutoff,
@@ -419,15 +491,18 @@ impl GpuResidentEngine {
             layout1,
             layout2,
             layout3,
+            layout4,
             pipelines,
             buf,
             bg0,
             bg1,
             bg2,
             bg3,
+            bg4,
         };
         engine.write_sim_params(0.0);
         engine.finish_upload(topology);
+        engine.upload_constraints(&constraints);
         engine.rebuild_neighbor_list();
         engine
     }
@@ -440,9 +515,12 @@ impl GpuResidentEngine {
             cells_y: self.cells.1,
             cells_z: self.cells.2,
             max_per_atom_excl: MAX_EXCL as u32,
+            max_per_atom_14: MAX_14 as u32,
             num_bonds: self.num_bonds as u32,
             num_angles: self.num_angles as u32,
             num_dihedrals: self.num_dihedrals as u32,
+            num_waters: self.num_waters as u32,
+            num_shake_bonds: self.num_shake_bonds as u32,
             box_lx: self.box_dims[0] as f32,
             box_ly: self.box_dims[1] as f32,
             box_lz: self.box_dims[2] as f32,
@@ -475,6 +553,7 @@ impl GpuResidentEngine {
                 pass.set_bind_group(1, &self.bg1, &[]);
                 pass.set_bind_group(2, &self.bg2, &[]);
                 pass.set_bind_group(3, &self.bg3, &[]);
+                pass.set_bind_group(4, &self.bg4, &[]);
                 pass.dispatch_workgroups(*groups, 1, 1);
             }
         }
@@ -618,11 +697,19 @@ impl GpuResidentEngine {
     }
 
     fn read_positions(&self) -> Vec<[f64; 3]> {
+        self.readback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.read_vec4(&self.buf.positions)
     }
 
     fn read_velocities(&self) -> Vec<[f64; 3]> {
+        self.readback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.read_vec4(&self.buf.velocities)
+    }
+
+    /// See the `readback_count` field doc: counts only the O(n) per-atom
+    /// position/velocity transfers, not small scalar readbacks.
+    pub(crate) fn readback_count(&self) -> u64 {
+        self.readback_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn read_vec4(&self, buf: &wgpu::Buffer) -> Vec<[f64; 3]> {
@@ -700,8 +787,9 @@ impl GpuResidentEngine {
         self.write_sim_params(dt);
         let skin = 0.2f64.max(self.cutoff * 0.1);
         let needs_pme = self.pbc;
-        let constraints = build_constraints(topology);
-        let has_water_constraints = !constraints.waters.is_empty();
+        let has_water_constraints = self.num_waters > 0;
+        let has_shake_bonds = self.num_shake_bonds > 0;
+        const SHAKE_ITERATIONS: u32 = 25;
 
         let mut rng_state = seed ^ 0x9E3779B97F4A7C15;
         let mut samples = Vec::new();
@@ -746,24 +834,42 @@ impl GpuResidentEngine {
 
         // Initial force evaluation.
         self.compute_nonbonded_and_bonded();
-        {
+        if needs_pme {
             let positions = self.read_positions();
             let (extra, _) = compute_cpu_extra(&positions);
             self.add_external_forces(&extra);
         }
 
         for step in 1..=n_steps {
-            let pre_step_positions = if has_water_constraints {
-                Some(self.read_positions())
-            } else {
-                None
-            };
+            // Snapshot pre-integration positions on the GPU (no readback):
+            // SETTLE's reference frame is the positions *before* this
+            // step's kick+drift (see constraints::settle_one's doc comment).
+            if has_water_constraints {
+                self.encode_and_submit(&[(
+                    &self.pipelines.snapshot_settle_ref,
+                    dispatch_1d(self.n as u32),
+                )]);
+            }
 
             self.encode_and_submit(&[(&self.pipelines.kick_half, dispatch_1d(self.n as u32))]);
             self.encode_and_submit(&[(&self.pipelines.drift, dispatch_1d(self.n as u32))]);
 
-            if let Some(ref_pos) = pre_step_positions.as_ref() {
-                self.apply_settle_position(topology, &constraints, ref_pos);
+            if has_water_constraints {
+                self.encode_and_submit(&[(
+                    &self.pipelines.settle_position,
+                    dispatch_1d(self.num_waters as u32),
+                )]);
+            }
+            if has_shake_bonds {
+                // Jacobi-parallel SHAKE: fixed iteration count rather than a
+                // convergence-residual readback (see gpu_resident.wgsl's
+                // `shake_correction_pass` doc comment).
+                for _ in 0..SHAKE_ITERATIONS {
+                    self.encode_and_submit(&[
+                        (&self.pipelines.shake_correction_pass, dispatch_1d(self.num_shake_bonds as u32)),
+                        (&self.pipelines.apply_shake_correction, dispatch_1d(self.n as u32)),
+                    ]);
+                }
             }
 
             if self.needs_rebuild(skin) {
@@ -771,14 +877,30 @@ impl GpuResidentEngine {
             }
 
             self.compute_nonbonded_and_bonded();
-            let positions_now = self.read_positions();
-            let (extra, extra_energy) = compute_cpu_extra(&positions_now);
-            self.add_external_forces(&extra);
+            let extra_energy = if needs_pme {
+                let positions_now = self.read_positions();
+                let (extra, extra_energy) = compute_cpu_extra(&positions_now);
+                self.add_external_forces(&extra);
+                extra_energy
+            } else {
+                0.0
+            };
 
             self.encode_and_submit(&[(&self.pipelines.kick_half, dispatch_1d(self.n as u32))]);
 
-            if let Some(ref_pos) = pre_step_positions.as_ref() {
-                self.apply_settle_velocity_pass(topology, &constraints, ref_pos, dt);
+            if has_water_constraints {
+                self.encode_and_submit(&[(
+                    &self.pipelines.settle_velocity,
+                    dispatch_1d(self.num_waters as u32),
+                )]);
+            }
+            if has_shake_bonds {
+                for _ in 0..SHAKE_ITERATIONS {
+                    self.encode_and_submit(&[
+                        (&self.pipelines.shake_velocity_pass, dispatch_1d(self.num_shake_bonds as u32)),
+                        (&self.pipelines.apply_shake_velocity_correction, dispatch_1d(self.n as u32)),
+                    ]);
+                }
             }
 
             match thermostat {
@@ -845,42 +967,6 @@ impl GpuResidentEngine {
         }
     }
 
-    /// Corrects the just-drifted (unconstrained) positions back onto the rigid
-    /// water manifold, using the existing analytic SETTLE routine.
-    fn apply_settle_position(
-        &self,
-        topology: &Topology,
-        constraints: &ConstraintSet,
-        reference: &[[f64; 3]],
-    ) {
-        let mut top = topology.clone();
-        let unconstrained = self.read_positions();
-        for (a, p) in top.atoms.iter_mut().zip(unconstrained.iter()) {
-            a.position = *p;
-        }
-        apply_settle_analytic(&mut top, reference, constraints);
-        let corrected: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
-        self.write_positions(&corrected);
-    }
-
-    /// Corrects velocities after the second half-kick so the rigid-water
-    /// distance constraints' time derivatives vanish (SETTLE's RATTLE-analog).
-    fn apply_settle_velocity_pass(
-        &self,
-        topology: &Topology,
-        constraints: &ConstraintSet,
-        reference: &[[f64; 3]],
-        dt: f64,
-    ) {
-        let mut top = topology.clone();
-        let positions = self.read_positions();
-        for (a, p) in top.atoms.iter_mut().zip(positions.iter()) {
-            a.position = *p;
-        }
-        let mut velocities = self.read_velocities();
-        apply_settle_velocity(reference, &top, &mut velocities, dt, constraints);
-        self.write_velocities(&velocities);
-    }
 }
 
 fn xorshift64(mut x: u64) -> u64 {
@@ -888,6 +974,27 @@ fn xorshift64(mut x: u64) -> u64 {
     x ^= x >> 7;
     x ^= x << 17;
     x
+}
+
+/// Build a fixed-capacity, symmetric per-atom 1-4 (dihedral end-atom) pair
+/// table for the GPU nonbonded kernel, mirroring `build_exclusion_table`
+/// below but for `cpu::build_14_pairs` (scaled, not excluded, nonbonded
+/// interactions).
+fn build_14_table(topology: &Topology) -> Vec<u32> {
+    let n = topology.atoms.len();
+    let pairs_14 = build_14_pairs(topology);
+    let mut sets: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    for (i, j) in pairs_14 {
+        sets[i].insert(j as u32);
+        sets[j].insert(i as u32);
+    }
+    let mut table = vec![0xffffffffu32; n * MAX_14];
+    for (i, set) in sets.iter().enumerate() {
+        for (k, j) in set.iter().take(MAX_14).enumerate() {
+            table[i * MAX_14 + k] = *j;
+        }
+    }
+    table
 }
 
 /// Build a fixed-capacity, symmetric per-atom exclusion table for the GPU kernel
@@ -943,6 +1050,7 @@ impl Buffers {
         let ke_accum = make_storage("ke_accum", 16, wgpu::BufferUsages::empty());
         let external_force = make_storage("external_force", vec4_size, wgpu::BufferUsages::empty());
         let nb_energy = make_storage("nb_energy", (n.max(1) * 4) as u64, wgpu::BufferUsages::empty());
+        let pairs14 = make_storage("pairs14", (n.max(1) * MAX_14 * 4) as u64, wgpu::BufferUsages::empty());
 
         let nb = topology.bonds.len().max(1);
         let na = topology.angles.len().max(1);
@@ -956,6 +1064,17 @@ impl Buffers {
         let bond_energy = make_storage("bond_energy", (nb * 4) as u64, wgpu::BufferUsages::empty());
         let angle_energy = make_storage("angle_energy", (na * 4) as u64, wgpu::BufferUsages::empty());
         let dihedral_energy = make_storage("dihedral_energy", (nd * 4) as u64, wgpu::BufferUsages::empty());
+
+        let constraints = build_constraints(topology);
+        let nw = constraints.waters.len().max(1);
+        let nsb = constraints.shake_bonds.len().max(1);
+        let water_idx = make_storage("water_idx", (nw * 16) as u64, wgpu::BufferUsages::empty());
+        let water_params = make_storage("water_params", (nw * 8) as u64, wgpu::BufferUsages::empty());
+        let settle_ref_positions = make_storage("settle_ref_positions", vec4_size, wgpu::BufferUsages::empty());
+        let shake_idx = make_storage("shake_idx", (nsb * 8) as u64, wgpu::BufferUsages::empty());
+        let shake_r0 = make_storage("shake_r0", (nsb * 4) as u64, wgpu::BufferUsages::empty());
+        let pos_correction_fp = make_storage("pos_correction_fp", (n.max(1) * 3 * 4) as u64, wgpu::BufferUsages::empty());
+
         let scale_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scale_uniform"),
             size: 16,
@@ -1012,6 +1131,13 @@ impl Buffers {
             ke_accum,
             external_force,
             nb_energy,
+            pairs14,
+            water_idx,
+            water_params,
+            settle_ref_positions,
+            shake_idx,
+            shake_r0,
+            pos_correction_fp,
             bond_idx,
             bond_params,
             angle_idx,
@@ -1067,6 +1193,12 @@ impl GpuResidentEngine {
                 .write_buffer(&self.buf.exclusions, 0, bytemuck::cast_slice(&excl));
         }
 
+        let pairs14 = build_14_table(topology);
+        if !pairs14.is_empty() {
+            self.queue
+                .write_buffer(&self.buf.pairs14, 0, bytemuck::cast_slice(&pairs14));
+        }
+
         if !topology.bonds.is_empty() {
             let idx: Vec<[u32; 2]> = topology.bonds.iter().map(|b| [b.i as u32, b.j as u32]).collect();
             let params: Vec<[f32; 2]> = topology
@@ -1111,6 +1243,37 @@ impl GpuResidentEngine {
                 .write_buffer(&self.buf.dihedral_idx, 0, bytemuck::cast_slice(&idx));
             self.queue
                 .write_buffer(&self.buf.dihedral_params, 0, bytemuck::cast_slice(&params));
+        }
+    }
+
+    /// Uploads the rigid-water (SETTLE) and solute H-bond (SHAKE) constraint
+    /// tables so the `settle_position`/`settle_velocity`/`shake_*` kernels
+    /// can run entirely on the GPU (see `docs/gpu_resident.md`).
+    fn upload_constraints(&self, constraints: &ConstraintSet) {
+        if !constraints.waters.is_empty() {
+            let idx: Vec<[u32; 4]> = constraints
+                .waters
+                .iter()
+                .map(|w| [w.o as u32, w.h1 as u32, w.h2 as u32, 0])
+                .collect();
+            let params: Vec<[f32; 2]> = constraints
+                .waters
+                .iter()
+                .map(|w| [w.roh as f32, w.rhh as f32])
+                .collect();
+            self.queue.write_buffer(&self.buf.water_idx, 0, bytemuck::cast_slice(&idx));
+            self.queue
+                .write_buffer(&self.buf.water_params, 0, bytemuck::cast_slice(&params));
+        }
+        if !constraints.shake_bonds.is_empty() {
+            let idx: Vec<[u32; 2]> = constraints
+                .shake_bonds
+                .iter()
+                .map(|&(i, j, _)| [i as u32, j as u32])
+                .collect();
+            let r0: Vec<f32> = constraints.shake_bonds.iter().map(|&(_, _, r0)| r0 as f32).collect();
+            self.queue.write_buffer(&self.buf.shake_idx, 0, bytemuck::cast_slice(&idx));
+            self.queue.write_buffer(&self.buf.shake_r0, 0, bytemuck::cast_slice(&r0));
         }
     }
 }
@@ -1159,6 +1322,7 @@ pub fn run_gpu_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraints::apply_settle_analytic;
     use crate::topology::{AngleTerm, AtomRecord, BondTerm, DihedralTerm, SimulationBox, Topology, TopologyMetadata};
 
     fn have_gpu_adapter() -> bool {
@@ -1187,6 +1351,57 @@ mod tests {
             molecule_id: 0,
             born_r: None,
         }
+    }
+
+    fn atom_elem(x: f64, y: f64, z: f64, charge: f64, mass: f64, element: &str) -> AtomRecord {
+        AtomRecord {
+            element: element.into(),
+            name: element.into(),
+            mass,
+            charge,
+            sigma: 0.315,
+            epsilon: 0.636,
+            position: [x, y, z],
+            residue_id: 0,
+            molecule_id: 0,
+            born_r: None,
+        }
+    }
+
+    /// A single TIP3P-geometry rigid water molecule (O, H1, H2), exactly on
+    /// the SETTLE constraint manifold (bond length `roh`, HOH angle
+    /// matching the same 1.824218134 rad default `build_constraints` falls
+    /// back to when no explicit angle term is present).
+    fn water_topology(center: [f64; 3]) -> Topology {
+        let roh = 0.09572;
+        let hoh: f64 = 1.824218134;
+        let o = center;
+        let h1 = [center[0] + roh, center[1], center[2]];
+        let h2 = [
+            center[0] + roh * hoh.cos(),
+            center[1] + roh * hoh.sin(),
+            center[2],
+        ];
+        let mut top = Topology {
+            version: 1,
+            metadata: TopologyMetadata::default(),
+            box_: SimulationBox { lx: 10.0, ly: 10.0, lz: 10.0, pbc: false },
+            atoms: vec![
+                atom_elem(o[0], o[1], o[2], -0.834, 16.0, "O"),
+                atom_elem(h1[0], h1[1], h1[2], 0.417, 1.008, "H"),
+                atom_elem(h2[0], h2[1], h2[2], 0.417, 1.008, "H"),
+            ],
+            bonds: vec![
+                BondTerm { i: 0, j: 1, k: 450.0, r0: roh },
+                BondTerm { i: 0, j: 2, k: 450.0, r0: roh },
+            ],
+            angles: vec![],
+            dihedrals: vec![],
+            impropers: vec![],
+            exclusions: vec![],
+        };
+        top.build_exclusions();
+        top
     }
 
     fn dimer_topology(r: f64, sigma: f64, epsilon: f64, q0: f64, q1: f64) -> Topology {
@@ -1254,23 +1469,24 @@ mod tests {
         assert!((gpu[0][0] + gpu[1][0]).abs() < 1e-3);
     }
 
-    fn chain_topology_no_nonbonded() -> Topology {
+    fn chain_topology_with_dihedral() -> Topology {
         // A 4-atom chain (bond 0-1-2-3, angles (0,1,2)/(1,2,3), dihedral
-        // (0,1,2,3)) with charge/sigma/epsilon all zero so the GPU
-        // nonbonded kernel contributes exactly zero force/energy. This
-        // isolates the bond+angle+dihedral kernels for parity testing
-        // without also exercising the (separately tracked, pre-existing)
-        // gap that the GPU nonbonded kernel doesn't apply CPU-style 1-4
-        // LJ/Coulomb scaling for dihedral end-atom pairs.
+        // (0,1,2,3)) with realistic nonzero charge/sigma/epsilon on every
+        // atom. Bonded (1-2) and angle (1-3) exclusions remove all
+        // nonbonded pairs except (0,3), the dihedral's 1-4 pair, which
+        // stays nonbonded-interacting but LJ/Coulomb-scaled — this
+        // specifically exercises the GPU-resident nonbonded kernel's 1-4
+        // scaling path (`is_14`/`LJ_14_SCALE`/`COULOMB_14_SCALE` in
+        // gpu_resident.wgsl) against `cpu::compute_forces_with_pme`.
         let mut top = Topology {
             version: 1,
             metadata: TopologyMetadata::default(),
             box_: SimulationBox { lx: 10.0, ly: 10.0, lz: 10.0, pbc: false },
             atoms: vec![
-                atom(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0),
-                atom(0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0),
-                atom(0.15, 0.15, 0.0, 0.0, 0.0, 0.0, 12.0),
-                atom(0.30, 0.15, 0.08, 0.0, 0.0, 0.0, 12.0),
+                atom(0.0, 0.0, 0.0, 0.3, 0.3, 0.2, 12.0),
+                atom(0.15, 0.0, 0.0, -0.2, 0.3, 0.2, 12.0),
+                atom(0.15, 0.15, 0.0, -0.2, 0.3, 0.2, 12.0),
+                atom(0.30, 0.15, 0.08, 0.3, 0.3, 0.2, 16.0),
             ],
             bonds: vec![
                 BondTerm { i: 0, j: 1, k: 300.0, r0: 0.15 },
@@ -1307,7 +1523,7 @@ mod tests {
             eprintln!("skipping: no GPU/Vulkan adapter available");
             return;
         }
-        let top = chain_topology_no_nonbonded();
+        let top = chain_topology_with_dihedral();
         let cutoff = 1.0;
         let gpu = gpu_forces_single_eval(&top, cutoff);
         let cpu = crate::forces::cpu::compute_forces_with_pme(&top, cutoff, None);
@@ -1335,7 +1551,7 @@ mod tests {
             eprintln!("skipping: no GPU/Vulkan adapter available");
             return;
         }
-        let top = chain_topology_no_nonbonded();
+        let top = chain_topology_with_dihedral();
         let cutoff = 1.0;
         let engine = GpuResidentEngine::new(&top, cutoff);
         engine.compute_nonbonded_and_bonded();
@@ -1405,5 +1621,172 @@ mod tests {
                 cpu.forces[0]
             );
         }
+    }
+
+    /// The `settle_position` WGSL kernel must match
+    /// `constraints::apply_settle_analytic` (the literal Miyamoto-Kollman
+    /// CPU reference) to <1e-5 for a perturbed ("unconstrained drift")
+    /// water molecule.
+    #[test]
+    fn settle_position_matches_cpu_reference() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let reference_top = water_topology([0.0, 0.0, 0.0]);
+        let reference: Vec<[f64; 3]> = reference_top.atoms.iter().map(|a| a.position).collect();
+
+        let mut unconstrained_top = reference_top.clone();
+        unconstrained_top.atoms[0].position[0] += 0.008;
+        unconstrained_top.atoms[0].position[1] -= 0.003;
+        unconstrained_top.atoms[1].position[1] -= 0.012;
+        unconstrained_top.atoms[1].position[2] += 0.006;
+        unconstrained_top.atoms[2].position[0] += 0.005;
+        unconstrained_top.atoms[2].position[2] -= 0.009;
+
+        let constraints = build_constraints(&reference_top);
+        let mut cpu_top = unconstrained_top.clone();
+        apply_settle_analytic(&mut cpu_top, &reference, &constraints);
+
+        let engine = GpuResidentEngine::new(&reference_top, 1.0);
+        let unconstrained_positions: Vec<[f64; 3]> =
+            unconstrained_top.atoms.iter().map(|a| a.position).collect();
+        engine.write_positions(&unconstrained_positions);
+        let ref_padded: Vec<[f32; 4]> = reference
+            .iter()
+            .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32, 0.0])
+            .collect();
+        engine
+            .queue
+            .write_buffer(&engine.buf.settle_ref_positions, 0, bytemuck::cast_slice(&ref_padded));
+        engine.encode_and_submit(&[(&engine.pipelines.settle_position, dispatch_1d(3))]);
+        engine.device.poll(wgpu::Maintain::Wait);
+        let gpu_corrected = engine.read_positions();
+
+        for atom_idx in 0..3 {
+            for k in 0..3 {
+                let g = gpu_corrected[atom_idx][k];
+                let c = cpu_top.atoms[atom_idx].position[k];
+                assert!(
+                    (g - c).abs() < 1e-5,
+                    "atom {atom_idx} axis {k}: gpu={g} cpu={c} diff={}",
+                    (g - c).abs()
+                );
+            }
+        }
+
+        // Both O-H bond lengths and the H-H distance must sit on the
+        // constraint manifold after correction (sanity check independent of
+        // the CPU comparison above).
+        let roh = 0.09572;
+        let d = |a: usize, b: usize| -> f64 {
+            let pa = gpu_corrected[a];
+            let pb = gpu_corrected[b];
+            ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt()
+        };
+        assert!((d(0, 1) - roh).abs() < 1e-5);
+        assert!((d(0, 2) - roh).abs() < 1e-5);
+    }
+
+    /// `settle_velocity` must remove the along-bond velocity components for
+    /// all three rigid-water pairs (O-H1, O-H2, H1-H2), matching what
+    /// `constraints::apply_settle_velocity` guarantees on the CPU path.
+    #[test]
+    fn settle_velocity_orthogonal_to_bonds_on_gpu() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let top = water_topology([0.0, 0.0, 0.0]);
+        let engine = GpuResidentEngine::new(&top, 1.0);
+        let velocities = vec![[0.3, -0.1, 0.05], [-0.2, 0.4, -0.1], [0.1, 0.15, 0.2]];
+        engine.write_velocities(&velocities);
+        engine.encode_and_submit(&[(&engine.pipelines.settle_velocity, dispatch_1d(3))]);
+        engine.device.poll(wgpu::Maintain::Wait);
+        let corrected = engine.read_velocities();
+        let positions: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
+
+        let bond_deriv = |a: usize, b: usize| -> f64 {
+            let dr = [
+                positions[b][0] - positions[a][0],
+                positions[b][1] - positions[a][1],
+                positions[b][2] - positions[a][2],
+            ];
+            let dv = [
+                corrected[b][0] - corrected[a][0],
+                corrected[b][1] - corrected[a][1],
+                corrected[b][2] - corrected[a][2],
+            ];
+            2.0 * (dr[0] * dv[0] + dr[1] * dv[1] + dr[2] * dv[2])
+        };
+        assert!(bond_deriv(0, 1).abs() < 1e-6, "d/dt|OH1|^2 = {}", bond_deriv(0, 1));
+        assert!(bond_deriv(0, 2).abs() < 1e-6, "d/dt|OH2|^2 = {}", bond_deriv(0, 2));
+        assert!(bond_deriv(1, 2).abs() < 1e-6, "d/dt|H1H2|^2 = {}", bond_deriv(1, 2));
+    }
+
+    /// A single rigid water, integrated 1000 NVE steps entirely GPU-resident
+    /// (SETTLE included, no per-step readback), must keep every constrained
+    /// bond/H-H distance within a tight tolerance of its target the whole
+    /// run — the constrained-drift analog of
+    /// `nve_energy_drift_bounded_over_1000_steps`.
+    #[test]
+    fn constrained_nve_1000_steps_bounded_drift() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let top = water_topology([0.0, 0.0, 0.0]);
+        let mut engine = GpuResidentEngine::new(&top, 1.0);
+        // Give it a little kinetic energy so it's not perfectly static.
+        engine.write_velocities(&[[0.02, -0.01, 0.0], [-0.03, 0.02, 0.01], [0.01, -0.02, -0.01]]);
+        let result = engine.run(&top, 1000, 0.0005, GpuResidentThermostat::None, 0.0, 1.0, 11, 0);
+        let roh = 0.09572;
+        let hoh: f64 = 1.824218134;
+        let rhh = (2.0 * roh * roh * (1.0 - hoh.cos())).sqrt();
+        let positions: Vec<[f64; 3]> = result.topology.atoms.iter().map(|a| a.position).collect();
+        let d = |a: usize, b: usize| -> f64 {
+            let pa = positions[a];
+            let pb = positions[b];
+            ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt()
+        };
+        assert!((d(0, 1) - roh).abs() < 1e-4, "OH1 drifted to {}", d(0, 1));
+        assert!((d(0, 2) - roh).abs() < 1e-4, "OH2 drifted to {}", d(0, 2));
+        assert!((d(1, 2) - rhh).abs() < 1e-4, "HH drifted to {}", d(1, 2));
+    }
+
+    /// No per-atom position/velocity readback should happen on non-output
+    /// steps once PME is off: with `output_interval: 0` (never record a
+    /// sample) and a non-periodic (PME-free) system, `readback_count()`
+    /// must not grow with the number of steps taken — only the
+    /// once-per-`run()` final position/velocity readback (used to build the
+    /// returned topology) should register, regardless of step count.
+    #[test]
+    fn zero_readbacks_on_non_output_steps_without_pme() {
+        if !have_gpu_adapter() {
+            eprintln!("skipping: no GPU/Vulkan adapter available");
+            return;
+        }
+        let top = water_topology([0.0, 0.0, 0.0]);
+
+        let mut engine_short = GpuResidentEngine::new(&top, 1.0);
+        let before_short = engine_short.readback_count();
+        engine_short.run(&top, 5, 0.0005, GpuResidentThermostat::None, 0.0, 1.0, 3, 0);
+        let after_short = engine_short.readback_count();
+
+        let mut engine_long = GpuResidentEngine::new(&top, 1.0);
+        let before_long = engine_long.readback_count();
+        engine_long.run(&top, 200, 0.0005, GpuResidentThermostat::None, 0.0, 1.0, 3, 0);
+        let after_long = engine_long.readback_count();
+
+        let delta_short = after_short - before_short;
+        let delta_long = after_long - before_long;
+        assert_eq!(
+            delta_short, delta_long,
+            "readback count grew with step count (short={delta_short}, long={delta_long}): \
+             a per-step readback must have crept back in"
+        );
+        // The only readbacks in an output_interval=0, PME-off run are the
+        // two at the very end of `run()` (final positions + velocities).
+        assert_eq!(delta_short, 2, "expected only the end-of-run position+velocity readback");
     }
 }
