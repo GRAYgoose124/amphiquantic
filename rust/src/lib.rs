@@ -17,7 +17,7 @@ mod utilities;
 
 use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, run_md, AtomPipelineParams};
-use integrator::{langevin_step, velocity_verlet_step, MdState, Restraint};
+use integrator::{md_step, parse_barostat, parse_thermostat, Barostat, MdState, Restraint};
 use minimize::minimize;
 use forces::{backend_from_env, compute_forces};
 use electrostatics::ewald_energy_correction;
@@ -124,7 +124,26 @@ fn write_final_checkpoint(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None, restart_traj=None, restraint_k=None, traj_format=None, checkpoint_out=None, checkpoint_in=None, energy_log=None))]
+#[pyo3(signature = (
+    path,
+    output_traj=None,
+    steps=None,
+    temperature=None,
+    restart_traj=None,
+    restraint_k=None,
+    thermostat=None,
+    barostat=None,
+    pressure=None,
+    tau_t=None,
+    tau_p=None,
+    com_remove_interval=None,
+    nh_chain_length=None,
+    mc_interval=None,
+    traj_format=None,
+    checkpoint_out=None,
+    checkpoint_in=None,
+    energy_log=None
+))]
 fn equilibrate_topology(
     path: &str,
     output_traj: Option<&str>,
@@ -132,11 +151,19 @@ fn equilibrate_topology(
     temperature: Option<f64>,
     restart_traj: Option<&str>,
     restraint_k: Option<f64>,
+    thermostat: Option<&str>,
+    barostat: Option<&str>,
+    pressure: Option<f64>,
+    tau_t: Option<f64>,
+    tau_p: Option<f64>,
+    com_remove_interval: Option<u64>,
+    nh_chain_length: Option<usize>,
+    mc_interval: Option<u64>,
     traj_format: Option<&str>,
     checkpoint_out: Option<&str>,
     checkpoint_in: Option<&str>,
     energy_log: Option<&str>,
-) -> PyResult<TopologyPy> {
+) -> PyResult<(TopologyPy, f64, f64)> {
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     let reference: Vec<[f64; 3]> = top.atoms.iter().map(|a| a.position).collect();
     if let Some(restart) = restart_traj {
@@ -158,6 +185,30 @@ fn equilibrate_topology(
             seed = ckpt.seed;
         }
     }
+    state.thermostat = parse_thermostat(thermostat.unwrap_or("langevin"), nh_chain_length.unwrap_or(3))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let requested_npt = barostat.is_some();
+    state.barostat = if requested_npt {
+        parse_barostat(barostat.unwrap_or("none")).map_err(pyo3::exceptions::PyValueError::new_err)?
+    } else {
+        Barostat::None
+    };
+    state.npt = requested_npt;
+    if let Some(p) = pressure {
+        state.pressure = p;
+    }
+    if let Some(t) = tau_t {
+        state.tau_t = t;
+    }
+    if let Some(t) = tau_p {
+        state.tau_p = t;
+    }
+    if let Some(c) = com_remove_interval {
+        state.com_remove_interval = c;
+    }
+    if let Some(m) = mc_interval {
+        state.mc_interval = m;
+    }
     if let Some(k) = restraint_k {
         if k > 0.0 {
             for (atom, pos) in reference.iter().enumerate() {
@@ -174,8 +225,12 @@ fn equilibrate_topology(
         .map(|p| EnergyLogWriter::new(p, false))
         .transpose()
         .map_err(pyo3::exceptions::PyIOError::new_err)?;
+    let mut last_temp = temp;
+    let mut last_pressure = 0.0;
     for step in 0..n_steps {
-        let res = langevin_step(&mut state, 1.0);
+        let res = md_step(&mut state, 1.0);
+        last_temp = res.temperature;
+        last_pressure = res.pressure;
         if let Some(w) = writer.as_mut() {
             w.write_frame(step, &state.topology, res.potential_energy, res.kinetic_energy)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
@@ -187,11 +242,30 @@ fn equilibrate_topology(
     }
     write_final_checkpoint(checkpoint_out, &state, n_steps, seed)?;
     top = state.topology;
-    Ok(TopologyPy { inner: top })
+    Ok((TopologyPy { inner: top }, last_temp, last_pressure))
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, output_traj=None, steps=None, temperature=None, restart_traj=None, npt=None, traj_format=None, checkpoint_out=None, checkpoint_in=None, energy_log=None))]
+#[pyo3(signature = (
+    path,
+    output_traj=None,
+    steps=None,
+    temperature=None,
+    restart_traj=None,
+    npt=None,
+    thermostat=None,
+    barostat=None,
+    pressure=None,
+    tau_t=None,
+    tau_p=None,
+    com_remove_interval=None,
+    nh_chain_length=None,
+    mc_interval=None,
+    traj_format=None,
+    checkpoint_out=None,
+    checkpoint_in=None,
+    energy_log=None
+))]
 fn simulate_topology(
     path: &str,
     output_traj: Option<&str>,
@@ -199,11 +273,19 @@ fn simulate_topology(
     temperature: Option<f64>,
     restart_traj: Option<&str>,
     npt: Option<bool>,
+    thermostat: Option<&str>,
+    barostat: Option<&str>,
+    pressure: Option<f64>,
+    tau_t: Option<f64>,
+    tau_p: Option<f64>,
+    com_remove_interval: Option<u64>,
+    nh_chain_length: Option<usize>,
+    mc_interval: Option<u64>,
     traj_format: Option<&str>,
     checkpoint_out: Option<&str>,
     checkpoint_in: Option<&str>,
     energy_log: Option<&str>,
-) -> PyResult<TopologyPy> {
+) -> PyResult<(TopologyPy, f64, f64)> {
     let mut top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     if let Some(restart) = restart_traj {
         TrajectoryReader::new(restart)
@@ -214,7 +296,6 @@ fn simulate_topology(
     let temp = temperature.unwrap_or(300.0);
     let mut state = MdState::new(top.clone(), temp);
     state.use_constraints = true;
-    state.npt = npt.unwrap_or(false);
     let mut seed = 0u64;
     if let Some(ckpt_path) = checkpoint_in {
         let ckpt = read_checkpoint(ckpt_path).map_err(pyo3::exceptions::PyIOError::new_err)?;
@@ -226,13 +307,42 @@ fn simulate_topology(
             seed = ckpt.seed;
         }
     }
+    state.thermostat = parse_thermostat(thermostat.unwrap_or("none"), nh_chain_length.unwrap_or(3))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let requested_npt = npt.unwrap_or(false) || barostat.is_some();
+    state.barostat = if requested_npt {
+        parse_barostat(barostat.unwrap_or("berendsen"))
+            .map_err(pyo3::exceptions::PyValueError::new_err)?
+    } else {
+        Barostat::None
+    };
+    state.npt = requested_npt;
+    if let Some(p) = pressure {
+        state.pressure = p;
+    }
+    if let Some(t) = tau_t {
+        state.tau_t = t;
+    }
+    if let Some(t) = tau_p {
+        state.tau_p = t;
+    }
+    if let Some(c) = com_remove_interval {
+        state.com_remove_interval = c;
+    }
+    if let Some(m) = mc_interval {
+        state.mc_interval = m;
+    }
     let mut writer = make_traj_writer(output_traj, traj_format)?;
     let mut elog = energy_log
         .map(|p| EnergyLogWriter::new(p, false))
         .transpose()
         .map_err(pyo3::exceptions::PyIOError::new_err)?;
+    let mut last_temp = temp;
+    let mut last_pressure = 0.0;
     for step in 0..n_steps {
-        let res = velocity_verlet_step(&mut state, 1.0);
+        let res = md_step(&mut state, 1.0);
+        last_temp = res.temperature;
+        last_pressure = res.pressure;
         if let Some(w) = writer.as_mut() {
             w.write_frame(step, &state.topology, res.potential_energy, res.kinetic_energy)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
@@ -244,7 +354,7 @@ fn simulate_topology(
     }
     write_final_checkpoint(checkpoint_out, &state, n_steps, seed)?;
     top = state.topology;
-    Ok(TopologyPy { inner: top })
+    Ok((TopologyPy { inner: top }, last_temp, last_pressure))
 }
 
 #[pyfunction]

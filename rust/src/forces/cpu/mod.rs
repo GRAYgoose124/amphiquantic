@@ -216,6 +216,70 @@ pub fn merge_force_results(a: ForceResult, b: ForceResult) -> ForceResult {
     }
 }
 
+/// Pairwise virial (sum of r_ij . f_ij) from 2-body bonded terms only.
+/// Angle/dihedral (3/4-body) contributions are not included: this is a
+/// standard, minor approximation for the scalar pressure estimate.
+pub fn compute_bonded_virial(topology: &Topology) -> f64 {
+    let mut virial = 0.0;
+    for bond in &topology.bonds {
+        let pi = topology.atoms[bond.i].position;
+        let pj = topology.atoms[bond.j].position;
+        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+        dr = minimum_image(dr, &topology.box_);
+        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+        let r = r2.sqrt().max(1e-12);
+        let dr_mag = r - bond.r0;
+        let force_scalar = -2.0 * bond.k * dr_mag / r;
+        virial += force_scalar * r2;
+    }
+    virial
+}
+
+/// Pairwise virial from nonbonded LJ + direct Coulomb interactions within
+/// `cutoff`. The PME reciprocal-space contribution is not included; this is
+/// an approximation acceptable for a scalar pressure estimate.
+pub fn compute_nonbonded_virial(topology: &Topology, cutoff: f64) -> f64 {
+    let nl = build_neighbor_list(topology, cutoff);
+    let pairs_14 = build_14_pairs(topology);
+    let mut virial = 0.0;
+    for &(i, j) in &nl.pairs {
+        let pi = topology.atoms[i].position;
+        let pj = topology.atoms[j].position;
+        let qi = topology.atoms[i].charge;
+        let qj = topology.atoms[j].charge;
+        let sigma = 0.5 * (topology.atoms[i].sigma + topology.atoms[j].sigma);
+        let mut epsilon = (topology.atoms[i].epsilon * topology.atoms[j].epsilon).sqrt();
+        let mut coulomb_scale = 1.0;
+        if pairs_14.contains(&(i.min(j), i.max(j))) {
+            epsilon *= LJ_14_SCALE;
+            coulomb_scale = COULOMB_14_SCALE;
+        }
+        let mut dr = [pj[0] - pi[0], pj[1] - pi[1], pj[2] - pi[2]];
+        dr = minimum_image(dr, &topology.box_);
+        let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+        let r = r2.sqrt().max(1e-12);
+
+        if sigma > 1e-8 && epsilon > 1e-12 {
+            let sr = sigma / r;
+            let sr6 = sr.powi(6);
+            let sr12 = sr6 * sr6;
+            let lj_force_scalar = 24.0 * epsilon * (2.0 * sr12 - sr6) / r;
+            virial += lj_force_scalar * r2;
+        }
+
+        let (_, coul_force) =
+            crate::electrostatics::ewald::direct_coulomb_energy_force(qi, qj, r, r2, coulomb_scale);
+        virial += coul_force * r2;
+    }
+    virial
+}
+
+/// Total scalar virial W = sum r_ij . f_ij used for pressure:
+/// P = (2*KE + W) / (3*V).
+pub fn compute_virial(topology: &Topology, cutoff: f64) -> f64 {
+    compute_bonded_virial(topology) + compute_nonbonded_virial(topology, cutoff)
+}
+
 fn build_14_pairs(topology: &Topology) -> std::collections::HashSet<(usize, usize)> {
     let mut pairs = std::collections::HashSet::new();
     for d in topology.dihedrals.iter().chain(topology.impropers.iter()) {
