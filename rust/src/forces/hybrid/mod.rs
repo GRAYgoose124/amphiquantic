@@ -38,7 +38,17 @@ pub fn compute_forces_hybrid(
             f[2] += fp[2];
         }
         result.potential_energy += pme.energy;
-        result.potential_energy += crate::electrostatics::ewald_energy_correction(topology);
+        result.potential_energy +=
+            crate::electrostatics::ewald_energy_correction_with_alpha(topology, ctx.alpha);
+
+        let (excl_energy, excl_forces, _) =
+            crate::electrostatics::excluded_pair_correction(topology, ctx.alpha);
+        result.potential_energy += excl_energy;
+        for (f, fe) in result.forces.iter_mut().zip(excl_forces.iter()) {
+            f[0] += fe[0];
+            f[1] += fe[1];
+            f[2] += fe[2];
+        }
     }
 
     result
