@@ -19,9 +19,8 @@ use builder::builder as build;
 use compute_pipeline::{run_atom_pipeline, run_md, AtomPipelineParams};
 use constraints::{build_constraints_with_algorithm, ConstraintAlgorithm};
 use integrator::{md_step, parse_barostat, parse_thermostat, Barostat, MdState, Restraint};
-use minimize::minimize;
+use minimize::minimize_with;
 use forces::{backend_from_env, compute_forces};
-use electrostatics::ewald_energy_correction_for_cutoff;
 use pdb::PdbFilePy;
 use topology::{SimulationBox, Topology, TopologyPy};
 use trajectory::{
@@ -99,29 +98,63 @@ fn ionize_topology(path: &str, output: Option<&str>) -> PyResult<TopologyPy> {
     Ok(TopologyPy { inner: top })
 }
 
+/// Slow, independent direct-Ewald reference total electrostatic energy
+/// (real-space minimum-image + brute-force reciprocal sum + self term),
+/// for validating the fast SPME path against. Intended for small test
+/// systems only (O(N*K^3)).
+#[pyfunction]
+#[pyo3(signature = (path, cutoff=1.0, ewald_rtol=1e-5, k_max=12))]
+fn direct_ewald_reference_energy(
+    path: &str,
+    cutoff: f64,
+    ewald_rtol: f64,
+    k_max: i64,
+) -> PyResult<f64> {
+    let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+    Ok(crate::electrostatics::pme::direct_ewald_total_energy(
+        &top, cutoff, ewald_rtol, k_max,
+    ))
+}
+
 #[pyfunction]
 fn topology_energy(path: &str) -> PyResult<f64> {
     let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
     let backend = backend_from_env();
+    // `compute_forces` already folds in the Ewald self-/background-energy
+    // correction for periodic (PME) systems internally (see
+    // `forces::compute_forces`); adding it again here double-counted it
+    // for every periodic topology.
     let result = compute_forces(&top, 1.0, backend);
-    Ok(result.potential_energy + ewald_energy_correction_for_cutoff(&top, 1.0))
+    Ok(result.potential_energy)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, output=None, max_steps=None, step_size=None))]
+#[pyo3(signature = (path, output=None, max_steps=None, step_size=None, emtol=None, minimizer=None))]
 fn minimize_topology(
     path: &str,
     output: Option<&str>,
     max_steps: Option<usize>,
     step_size: Option<f64>,
+    emtol: Option<f64>,
+    minimizer: Option<&str>,
 ) -> PyResult<(TopologyPy, f64, usize)> {
     let top = Topology::read(path).map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-    let result = minimize(
+    let kind = match minimizer.unwrap_or("lbfgs") {
+        "lbfgs" => crate::minimize::MinimizerKind::LBfgs,
+        "sd" | "steepest_descent" => crate::minimize::MinimizerKind::SteepestDescent,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown minimizer '{other}', expected 'lbfgs' or 'sd'"
+            )))
+        }
+    };
+    let result = minimize_with(
         top,
         1.0,
         max_steps.unwrap_or(100),
         step_size.unwrap_or(0.001),
-        1e-4,
+        emtol.unwrap_or(10.0),
+        kind,
     );
     if let Some(out) = output {
         result
@@ -578,6 +611,7 @@ fn rustquantic(_py: Python, m: Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PdbFilePy>()?;
     m.add_class::<TopologyPy>()?;
     m.add_function(wrap_pyfunction_bound!(topology_energy, &m)?)?;
+    m.add_function(wrap_pyfunction_bound!(direct_ewald_reference_energy, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(ionize_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(load_topology, &m)?)?;
     m.add_function(wrap_pyfunction_bound!(minimize_topology, &m)?)?;

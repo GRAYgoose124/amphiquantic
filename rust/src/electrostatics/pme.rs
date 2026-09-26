@@ -12,6 +12,7 @@
 use crate::topology::Topology;
 use rayon::prelude::*;
 use rustfft::{num_complex::Complex64, FftDirection, FftPlanner};
+use std::f64::consts::PI;
 
 const COULOMB_CONSTANT: f64 = 138.935456;
 
@@ -450,6 +451,89 @@ pub fn compute_pme_forces(topology: &Topology, ctx: &PmeContext) -> PmeResult {
     }
 }
 
+/// Brute-force O(N*K^3) direct reciprocal Ewald sum plus the matching
+/// real-space (minimum-image) and self-energy terms, using the exact same
+/// alpha the SPME path would pick for `ewald_rtol`/`cutoff`. This is a slow
+/// correctness reference only — used by tests to validate the fast SPME
+/// implementation (`compute_pme_forces`) against an independent
+/// implementation of the same Ewald sum, not a production code path.
+pub fn direct_ewald_total_energy(
+    topology: &Topology,
+    cutoff: f64,
+    ewald_rtol: f64,
+    k_max: i64,
+) -> f64 {
+    let alpha = ewald_alpha_from_rtol(cutoff, ewald_rtol);
+    let lengths = [topology.box_.lx, topology.box_.ly, topology.box_.lz];
+    let volume = lengths[0] * lengths[1] * lengths[2];
+    let coeff = COULOMB_CONSTANT / (2.0 * PI * volume);
+    let pi2 = PI * PI;
+
+    // Reciprocal-space sum.
+    let mut recip_energy = 0.0;
+    for mx in -k_max..=k_max {
+        for my in -k_max..=k_max {
+            for mz in -k_max..=k_max {
+                if mx == 0 && my == 0 && mz == 0 {
+                    continue;
+                }
+                let m = [
+                    mx as f64 / lengths[0],
+                    my as f64 / lengths[1],
+                    mz as f64 / lengths[2],
+                ];
+                let m2 = m[0] * m[0] + m[1] * m[1] + m[2] * m[2];
+                let theta = (-pi2 * m2 / (alpha * alpha)).exp() / m2;
+                let mut sk = 0.0;
+                let mut ck = 0.0;
+                for atom in &topology.atoms {
+                    let phase = 2.0
+                        * PI
+                        * (m[0] * atom.position[0]
+                            + m[1] * atom.position[1]
+                            + m[2] * atom.position[2]);
+                    sk += atom.charge * phase.sin();
+                    ck += atom.charge * phase.cos();
+                }
+                recip_energy += coeff * theta * (sk * sk + ck * ck);
+            }
+        }
+    }
+
+    // Real-space (minimum-image) sum.
+    let mut real_energy = 0.0;
+    let n = topology.atoms.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut dr = [0.0; 3];
+            for k in 0..3 {
+                let mut d = topology.atoms[j].position[k] - topology.atoms[i].position[k];
+                d -= (d / lengths[k]).round() * lengths[k];
+                dr[k] = d;
+            }
+            let r2 = dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2];
+            let r = r2.sqrt();
+            if r >= cutoff {
+                continue;
+            }
+            let (e, _) = crate::electrostatics::ewald::screened_coulomb_energy_force(
+                topology.atoms[i].charge,
+                topology.atoms[j].charge,
+                r,
+                r2,
+                alpha,
+                1.0,
+            );
+            real_energy += e;
+        }
+    }
+
+    let self_energy: f64 = -COULOMB_CONSTANT * alpha / PI.sqrt()
+        * topology.atoms.iter().map(|a| a.charge * a.charge).sum::<f64>();
+
+    recip_energy + real_energy + self_energy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,7 +715,7 @@ mod tests {
         }
 
         let cutoff = 0.49;
-        let ctx = PmeContext::with_params(&top, cutoff, 1e-6, 0.02, 6);
+        let ctx = PmeContext::with_params(&top, cutoff, 1e-8, 0.01, 8);
         let recip = compute_pme_forces(&top, &ctx);
 
         // Real-space (minimum-image, single shell is enough given the
@@ -670,7 +754,7 @@ mod tests {
         let madelung = -2.0 * per_ion * a / COULOMB_CONSTANT;
 
         assert!(
-            (madelung - 1.747565).abs() < 0.02,
+            (madelung - 1.747565).abs() < 1e-4,
             "madelung constant off: got {madelung}"
         );
     }

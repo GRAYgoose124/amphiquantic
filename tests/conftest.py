@@ -37,12 +37,23 @@ def repo_root() -> Path:
 
 @pytest.fixture(scope="session")
 def built_extension(repo_root):
-    """Build rustquantic once per session."""
-    subprocess.run(["uv", "sync"], cwd=repo_root, check=True, capture_output=True)
+    """Build rustquantic once per session.
+
+    Uses `--inexact` so this does not strip optional extras (e.g. the
+    `openff` extra's openff-toolkit/rdkit/python-constraint) that were
+    already installed into the environment before pytest started —
+    otherwise `-m openff` tests would non-deterministically fail with
+    ModuleNotFoundError the first time this fixture (or `uv run maturin
+    develop`) resynced the environment mid-session.
+    """
+    subprocess.run(
+        ["uv", "sync", "--inexact"], cwd=repo_root, check=True, capture_output=True
+    )
     subprocess.run(
         [
             "uv",
             "run",
+            "--no-sync",
             "maturin",
             "develop",
             "--manifest-path",

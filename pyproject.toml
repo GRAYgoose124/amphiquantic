@@ -29,6 +29,9 @@ openff = [
     "cached-property",
     "python-constraint",
     "pydantic",
+    # OpenFF's Molecule.from_smiles needs a cheminformatics backend; RDKit
+    # (BSD-licensed, PyPI wheel) is the FOSS choice OpenFF itself documents.
+    "rdkit",
 ]
 protein = [
     "openmmforcefields>=0.12.0",
