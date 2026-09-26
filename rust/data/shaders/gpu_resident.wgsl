@@ -26,6 +26,10 @@ struct SimParams {
     num_dihedrals: u32,
     num_waters: u32,
     num_shake_bonds: u32,
+    pme_grid_x: u32,
+    pme_grid_y: u32,
+    pme_grid_z: u32,
+    pme_order: u32,
     box_lx: f32,
     box_ly: f32,
     box_lz: f32,
@@ -83,6 +87,16 @@ const COULOMB_14_SCALE: f32 = 1.0 / 1.2;
 @group(4) @binding(3) var<storage, read> shake_idx: array<vec2<u32>>; // i, j
 @group(4) @binding(4) var<storage, read> shake_r0: array<f32>;
 @group(4) @binding(5) var<storage, read_write> pos_correction_fp: array<atomic<i32>>; // 3*num_atoms, fixed point
+
+// ---- PME (group 5): GPU B-spline charge spreading + force gather; the
+// forward FFT / influence-function multiply / inverse FFT happens on the
+// CPU (electrostatics::pme::pme_recip_from_grid) between a grid download
+// and a grid upload — never a per-atom position readback. See
+// docs/gpu_resident.md "PME: GPU spreading + CPU FFT". ----
+@group(5) @binding(0) var<storage, read_write> q_grid_fp: array<atomic<i32>>; // nx*ny*nz, fixed point charge density
+@group(5) @binding(1) var<storage, read> pme_potential_grid: array<f32>; // nx*ny*nz, 2*Re(theta_q) after inverse FFT
+@group(5) @binding(2) var<storage, read_write> excl_energy: array<f32>; // per-atom, 0.5*sum(excluded/1-4 correction energy)
+@group(5) @binding(3) var<storage, read_write> philox_debug_out: array<vec4<u32>>; // 1 element, KAT-test output
 
 fn erfc_approx(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.5 * abs(x));
@@ -440,6 +454,14 @@ fn drift(@builtin(global_invocation_id) gid: vec3<u32>) {
     positions[atom] = vec4<f32>(positions[atom].xyz + sim.dt * velocities[atom].xyz, 0.0);
 }
 
+// BAOAB's "A" sub-step (dt/2 drift, applied twice around the O-step).
+@compute @workgroup_size(64)
+fn half_drift(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    positions[atom] = vec4<f32>(positions[atom].xyz + 0.5 * sim.dt * velocities[atom].xyz, 0.0);
+}
+
 @compute @workgroup_size(64)
 fn ke_reduce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let atom = gid.x;
@@ -464,11 +486,139 @@ struct ScaleUniform {
 }
 @group(3) @binding(0) var<uniform> scale_u: ScaleUniform;
 
+struct LangevinUniform {
+    seed0: u32,
+    seed1: u32,
+    step: u32,
+    target_temperature: f32,
+    gamma: f32,
+    _p0: f32,
+    _p1: f32,
+    _p2: f32,
+}
+@group(3) @binding(1) var<uniform> langevin_u: LangevinUniform;
+
+struct PhiloxTestUniform {
+    ctr0: u32,
+    ctr1: u32,
+    ctr2: u32,
+    ctr3: u32,
+    key0: u32,
+    key1: u32,
+    _p0: u32,
+    _p1: u32,
+}
+@group(3) @binding(2) var<uniform> philox_test: PhiloxTestUniform;
+
 @compute @workgroup_size(64)
 fn scale_velocities(@builtin(global_invocation_id) gid: vec3<u32>) {
     let atom = gid.x;
     if (atom >= sim.num_atoms) { return; }
     velocities[atom] = vec4<f32>(velocities[atom].xyz * scale_u.scale, 0.0);
+}
+
+// ---- Philox4x32-10 counter-based RNG (Salmon, Moraes, Dror & Shaw, 2011 —
+// the Random123 algorithm) + Box-Muller normals, for the BAOAB Langevin
+// O-step below. Bit-exact port of rust/src/random/mod.rs's
+// `philox4x32_10`/`box_muller` (that module's `philox_matches_random123_
+// kat_vectors` test checks the same round structure against the published
+// Random123 reference vectors; `philox_debug` below lets a Rust test
+// dispatch this exact WGSL implementation and compare its output to that
+// same Rust reference, cross-validating the port on real
+// hardware/lavapipe). Every atom/DOF gets its own independent draw from
+// `(key, counter)` alone: `key = (seed0, seed1)` is fixed for the whole run,
+// `counter = (step, atom_index, 0, 0)`, so no shared RNG state is needed and
+// results don't depend on dispatch/thread order.
+const PHILOX_M0: u32 = 0xD2511F53u;
+const PHILOX_M1: u32 = 0xCD9E8D57u;
+const PHILOX_W0: u32 = 0x9E3779B9u;
+const PHILOX_W1: u32 = 0xBB67AE85u;
+
+// Returns (lo, hi) of the full 64-bit product a*b, via 16-bit-limb long
+// multiplication (WGSL has no native 64-bit integer type); u32 arithmetic
+// wraps mod 2^32 per the WGSL spec, which is exactly what a lo/hi split
+// needs.
+fn mulhilo32(a: u32, b: u32) -> vec2<u32> {
+    let alo = a & 0xffffu;
+    let ahi = a >> 16u;
+    let blo = b & 0xffffu;
+    let bhi = b >> 16u;
+
+    let p0 = alo * blo;
+    let p1 = alo * bhi;
+    let p2 = ahi * blo;
+    let p3 = ahi * bhi;
+
+    let carry = ((p0 >> 16u) + (p1 & 0xffffu) + (p2 & 0xffffu)) >> 16u;
+
+    let lo = p0 + ((p1 & 0xffffu) << 16u) + ((p2 & 0xffffu) << 16u);
+    let hi = p3 + (p1 >> 16u) + (p2 >> 16u) + carry;
+    return vec2<u32>(lo, hi);
+}
+
+fn philox4x32_10(counter_in: vec4<u32>, key_in: vec2<u32>) -> vec4<u32> {
+    var c = counter_in;
+    var k = key_in;
+    for (var r = 0u; r < 10u; r = r + 1u) {
+        let hilo0 = mulhilo32(PHILOX_M0, c.x);
+        let hilo1 = mulhilo32(PHILOX_M1, c.z);
+        let lo0 = hilo0.x;
+        let hi0 = hilo0.y;
+        let lo1 = hilo1.x;
+        let hi1 = hilo1.y;
+        c = vec4<u32>(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+        k.x = k.x + PHILOX_W0;
+        k.y = k.y + PHILOX_W1;
+    }
+    return c;
+}
+
+fn box_muller(u1: u32, u2: u32) -> vec2<f32> {
+    let r1 = max((f32(u1) + 0.5) / 4294967296.0, 1e-30);
+    let r2 = (f32(u2) + 0.5) / 4294967296.0;
+    let radius = sqrt(-2.0 * log(r1));
+    let theta = 2.0 * 3.14159265 * r2;
+    return vec2<f32>(radius * cos(theta), radius * sin(theta));
+}
+
+@compute @workgroup_size(1)
+fn philox_debug(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+    let ctr = vec4<u32>(philox_test.ctr0, philox_test.ctr1, philox_test.ctr2, philox_test.ctr3);
+    let key = vec2<u32>(philox_test.key0, philox_test.key1);
+    philox_debug_out[0] = philox4x32_10(ctr, key);
+}
+
+// ---- BAOAB Langevin: full per-atom O-step on the GPU, no readback. ----
+// The B (kick) and A (drift) sub-steps reuse the existing `kick_half`/
+// `drift` kernels (called twice each, around this O-step, by
+// `GpuResidentEngine::run`); SETTLE/SHAKE position and velocity constraints
+// are re-applied after each A and after this O exactly as they are for the
+// unthermostatted integrator, so this is compatible with rigid
+// water/solute H-bonds. v_new = c1*v + c2*sqrt(kB*T/m)*N(0,1) per DOF,
+// c1 = exp(-gamma*dt), c2 = sqrt(1 - c1^2) — the standard BAOAB
+// Ornstein-Uhlenbeck velocity update (Leimkuhler & Matthews).
+const LANGEVIN_KB: f32 = 0.0019872041; // kcal/mol/K, matches the rest of the codebase
+
+@compute @workgroup_size(64)
+fn langevin_o_step(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    let inv_m = atom_params[atom].w;
+    if (inv_m <= 0.0) { return; }
+    let mass = 1.0 / inv_m;
+
+    let c1 = exp(-langevin_u.gamma * sim.dt);
+    let c2 = sqrt(max(1.0 - c1 * c1, 0.0) * LANGEVIN_KB * langevin_u.target_temperature / mass);
+
+    let ctr = vec4<u32>(langevin_u.step, atom, 0u, 0u);
+    let key = vec2<u32>(langevin_u.seed0, langevin_u.seed1);
+    let r = philox4x32_10(ctr, key);
+    let bm1 = box_muller(r.x, r.y);
+    let bm2 = box_muller(r.z, r.w);
+    let noise = vec3<f32>(bm1.x, bm1.y, bm2.x);
+
+    velocities[atom] = vec4<f32>(velocities[atom].xyz * c1 + noise * c2, 0.0);
 }
 
 // ---- constraints: SETTLE (literal Miyamoto-Kollman, ported from
@@ -757,4 +907,225 @@ fn apply_shake_velocity_correction(@builtin(global_invocation_id) gid: vec3<u32>
     atomicStore(&pos_correction_fp[atom * 3u + 0u], 0);
     atomicStore(&pos_correction_fp[atom * 3u + 1u], 0);
     atomicStore(&pos_correction_fp[atom * 3u + 2u], 0);
+}
+
+// ---- PME: GPU B-spline charge spreading + force gather ----
+// Literal port of electrostatics::pme's `fill_bspline` (Cardinal B-spline
+// weights/derivatives, de Boor recursion) and `atom_splines`
+// (fractional-coordinate + base-grid-index setup), so the spread/gather
+// weights match the CPU `pme_recip_from_grid` pipeline exactly. MAX_PME_ORDER
+// mirrors `PmeContext::with_params`'s `order.clamp(3, 8)`.
+const MAX_PME_ORDER: u32 = 8u;
+const PME_FP_SCALE: f32 = 1048576.0;
+
+fn fill_bspline(w: f32, order: u32, arr: ptr<function, array<f32, 8>>, darr: ptr<function, array<f32, 8>>) {
+    for (var i = 0u; i < MAX_PME_ORDER; i = i + 1u) {
+        (*arr)[i] = 0.0;
+        (*darr)[i] = 0.0;
+    }
+    (*arr)[1] = w;
+    (*arr)[0] = 1.0 - w;
+
+    for (var k = 3u; k < order; k = k + 1u) {
+        let div = 1.0 / (f32(k) - 1.0);
+        (*arr)[k - 1u] = div * w * (*arr)[k - 2u];
+        for (var j = 1u; j < (k - 1u); j = j + 1u) {
+            (*arr)[k - 1u - j] = div * ((w + f32(j)) * (*arr)[k - 2u - j] + (f32(k) - f32(j) - w) * (*arr)[k - 1u - j]);
+        }
+        (*arr)[0] = div * (1.0 - w) * (*arr)[0];
+    }
+
+    (*darr)[0] = -(*arr)[0];
+    for (var j = 1u; j < order; j = j + 1u) {
+        (*darr)[j] = (*arr)[j - 1u] - (*arr)[j];
+    }
+
+    let k = order;
+    let div = 1.0 / (f32(k) - 1.0);
+    (*arr)[k - 1u] = div * w * (*arr)[k - 2u];
+    for (var j = 1u; j < (k - 1u); j = j + 1u) {
+        (*arr)[k - 1u - j] = div * ((w + f32(j)) * (*arr)[k - 2u - j] + (f32(k) - f32(j) - w) * (*arr)[k - 1u - j]);
+    }
+    (*arr)[0] = div * (1.0 - w) * (*arr)[0];
+}
+
+// Per-dimension fractional coordinate + B-spline weights/derivatives,
+// reversed so `w[i]`/`dw[i]` line up with grid point `(base - i)`, matching
+// `atom_splines`'s convention exactly.
+fn atom_spline_dim(
+    pos_d: f32,
+    length_d: f32,
+    grid_d: u32,
+    order: u32,
+    base: ptr<function, i32>,
+    w: ptr<function, array<f32, 8>>,
+    dw: ptr<function, array<f32, 8>>,
+) {
+    let l = max(length_d, 1e-12);
+    var s = pos_d / l;
+    s = s - floor(s);
+    let u = s * f32(grid_d);
+    let u0 = floor(u);
+    let frac = clamp(u - u0, 0.0, 1.0 - 1e-6);
+    *base = i32(u0);
+    var arr: array<f32, 8>;
+    var darr: array<f32, 8>;
+    fill_bspline(frac, order, &arr, &darr);
+    for (var i = 0u; i < order; i = i + 1u) {
+        (*w)[i] = arr[order - 1u - i];
+        (*dw)[i] = darr[order - 1u - i];
+    }
+}
+
+fn pme_grid_idx(base: i32, i: u32, dim: u32) -> u32 {
+    let raw = base - i32(i);
+    let m = raw % i32(dim);
+    return u32(select(m, m + i32(dim), m < 0));
+}
+
+@compute @workgroup_size(64)
+fn pme_clear_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = sim.pme_grid_x * sim.pme_grid_y * sim.pme_grid_z;
+    if (idx >= total) { return; }
+    atomicStore(&q_grid_fp[idx], 0);
+}
+
+@compute @workgroup_size(64)
+fn pme_spread(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    let q = atom_params[atom].x;
+    if (abs(q) < 1e-12) { return; }
+    let pos = positions[atom].xyz;
+
+    var basex: i32; var wx: array<f32, 8>; var dwx: array<f32, 8>;
+    var basey: i32; var wy: array<f32, 8>; var dwy: array<f32, 8>;
+    var basez: i32; var wz: array<f32, 8>; var dwz: array<f32, 8>;
+    atom_spline_dim(pos.x, sim.box_lx, sim.pme_grid_x, sim.pme_order, &basex, &wx, &dwx);
+    atom_spline_dim(pos.y, sim.box_ly, sim.pme_grid_y, sim.pme_order, &basey, &wy, &dwy);
+    atom_spline_dim(pos.z, sim.box_lz, sim.pme_grid_z, sim.pme_order, &basez, &wz, &dwz);
+
+    for (var ix = 0u; ix < sim.pme_order; ix = ix + 1u) {
+        let gx = pme_grid_idx(basex, ix, sim.pme_grid_x);
+        let wxv = wx[ix];
+        if (wxv == 0.0) { continue; }
+        for (var iy = 0u; iy < sim.pme_order; iy = iy + 1u) {
+            let gy = pme_grid_idx(basey, iy, sim.pme_grid_y);
+            let wxy = wxv * wy[iy];
+            if (wxy == 0.0) { continue; }
+            let row = (gx * sim.pme_grid_y + gy) * sim.pme_grid_z;
+            for (var iz = 0u; iz < sim.pme_order; iz = iz + 1u) {
+                let gz = pme_grid_idx(basez, iz, sim.pme_grid_z);
+                let weight = wxy * wz[iz];
+                atomicAdd(&q_grid_fp[row + gz], i32(q * weight * PME_FP_SCALE));
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn pme_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let atom = gid.x;
+    if (atom >= sim.num_atoms) { return; }
+    let q = atom_params[atom].x;
+    if (abs(q) < 1e-12) { return; }
+    let pos = positions[atom].xyz;
+
+    var basex: i32; var wx: array<f32, 8>; var dwx: array<f32, 8>;
+    var basey: i32; var wy: array<f32, 8>; var dwy: array<f32, 8>;
+    var basez: i32; var wz: array<f32, 8>; var dwz: array<f32, 8>;
+    atom_spline_dim(pos.x, sim.box_lx, sim.pme_grid_x, sim.pme_order, &basex, &wx, &dwx);
+    atom_spline_dim(pos.y, sim.box_ly, sim.pme_grid_y, sim.pme_order, &basey, &wy, &dwy);
+    atom_spline_dim(pos.z, sim.box_lz, sim.pme_grid_z, sim.pme_order, &basez, &wz, &dwz);
+
+    let scale_x = f32(sim.pme_grid_x) / sim.box_lx;
+    let scale_y = f32(sim.pme_grid_y) / sim.box_ly;
+    let scale_z = f32(sim.pme_grid_z) / sim.box_lz;
+
+    var f = vec3<f32>(0.0, 0.0, 0.0);
+    for (var ix = 0u; ix < sim.pme_order; ix = ix + 1u) {
+        let gx = pme_grid_idx(basex, ix, sim.pme_grid_x);
+        let wxv = wx[ix];
+        let dwxv = dwx[ix];
+        for (var iy = 0u; iy < sim.pme_order; iy = iy + 1u) {
+            let gy = pme_grid_idx(basey, iy, sim.pme_grid_y);
+            let wyv = wy[iy];
+            let dwyv = dwy[iy];
+            let row = (gx * sim.pme_grid_y + gy) * sim.pme_grid_z;
+            for (var iz = 0u; iz < sim.pme_order; iz = iz + 1u) {
+                let gz = pme_grid_idx(basez, iz, sim.pme_grid_z);
+                let wzv = wz[iz];
+                let dwzv = dwz[iz];
+                let g = pme_potential_grid[row + gz];
+                f.x -= q * dwxv * wyv * wzv * scale_x * g;
+                f.y -= q * wxv * dwyv * wzv * scale_y * g;
+                f.z -= q * wxv * wyv * dwzv * scale_z * g;
+            }
+        }
+    }
+    add_force_fp(atom, f);
+}
+
+// ---- Exclusion / 1-4 real-space correction for PME ----
+// The reciprocal sum implicitly includes the full q_i*q_j/r interaction for
+// every pair, including bonded exclusions and 1-4 pairs whose direct-space
+// term was zeroed or scaled; this subtracts erf(alpha*r)/r times
+// (1 - scale) for each, on the GPU, from the same per-atom exclusion/1-4
+// tables the nonbonded kernel already uses — a literal port of
+// electrostatics::excluded_pair_correction, per-atom rather than per-pair
+// (each atom visits its own exclusion/1-4 partners and applies half the
+// correction, so summing over atoms gives the same total as summing once
+// per unique pair).
+@compute @workgroup_size(64)
+fn exclusion_correction(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= sim.num_atoms) { return; }
+    if (sim.alpha <= 0.0) {
+        excl_energy[i] = 0.0;
+        return;
+    }
+    let pi = positions[i].xyz;
+    let qi = atom_params[i].x;
+    var eacc = 0.0;
+    var facc = vec3<f32>(0.0, 0.0, 0.0);
+
+    for (var k = 0u; k < sim.max_per_atom_excl; k = k + 1u) {
+        let j = exclusions[i * MAX_EXCL + k];
+        if (j == 0xffffffffu) { break; }
+        let qj = atom_params[j].x;
+        if (qi == 0.0 || qj == 0.0) { continue; }
+        let dr = mic(positions[j].xyz - pi);
+        let r2 = max(dot(dr, dr), 1e-12);
+        let r = sqrt(r2);
+        let arg = sim.alpha * r;
+        let erf_val = 1.0 - erfc_approx(arg);
+        let pref = sim.coulomb * qi * qj; // one_minus_scale = 1.0 (full exclusion)
+        let e = -pref * erf_val / r;
+        eacc += 0.5 * e;
+        let derf_dr = (2.0 * sim.alpha / sqrt(3.14159265)) * exp(-arg * arg);
+        let fscalar = pref * (derf_dr / r - erf_val / r2) / r;
+        facc -= fscalar * dr;
+    }
+    for (var k = 0u; k < sim.max_per_atom_14; k = k + 1u) {
+        let j = pairs14[i * MAX_14 + k];
+        if (j == 0xffffffffu) { break; }
+        let qj = atom_params[j].x;
+        let one_minus_scale = 1.0 - COULOMB_14_SCALE;
+        if (qi == 0.0 || qj == 0.0) { continue; }
+        let dr = mic(positions[j].xyz - pi);
+        let r2 = max(dot(dr, dr), 1e-12);
+        let r = sqrt(r2);
+        let arg = sim.alpha * r;
+        let erf_val = 1.0 - erfc_approx(arg);
+        let pref = sim.coulomb * qi * qj * one_minus_scale;
+        let e = -pref * erf_val / r;
+        eacc += 0.5 * e;
+        let derf_dr = (2.0 * sim.alpha / sqrt(3.14159265)) * exp(-arg * arg);
+        let fscalar = pref * (derf_dr / r - erf_val / r2) / r;
+        facc -= fscalar * dr;
+    }
+
+    excl_energy[i] = eacc;
+    add_force_fp(i, facc);
 }

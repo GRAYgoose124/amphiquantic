@@ -65,9 +65,23 @@ pub fn excluded_pair_correction(
         return (energy, forces, virial);
     }
 
+    // `topology.exclusions` stores each excluded bond in *both* directions
+    // (`build_exclusions` pushes `[i, j]` and `[j, i]`, since the rest of
+    // the codebase uses it as a per-atom O(1) exclusion-membership lookup,
+    // not a unique-pair list). Iterating it directly here, one correction
+    // per entry, would apply the same pair's correction twice (once as
+    // `(i, j)`, once as `(j, i)` — same force magnitude and energy each
+    // time, since the correction formula is symmetric in `i`/`j`) — a
+    // silent 2x error in both the exclusion-correction energy and forces
+    // for every periodic system with any bonded exclusions. Deduplicate to
+    // unique unordered pairs first.
+    let mut seen_excl = std::collections::HashSet::new();
     let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
     for e in &topology.exclusions {
-        pairs.push((e[0], e[1], 0.0));
+        let (a, b) = (e[0].min(e[1]), e[0].max(e[1]));
+        if seen_excl.insert((a, b)) {
+            pairs.push((a, b, 0.0));
+        }
     }
     let coulomb_14_scale = 1.0 / 1.2;
     let mut seen14 = std::collections::HashSet::new();

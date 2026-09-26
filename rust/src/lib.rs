@@ -11,6 +11,7 @@ mod integrator;
 mod minimize;
 mod neighbor;
 mod pdb;
+mod random;
 mod topology;
 mod trajectory;
 mod utilities;

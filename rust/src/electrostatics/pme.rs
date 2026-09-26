@@ -181,7 +181,7 @@ fn fill_bspline(w: f64, order: usize) -> (Vec<f64>, Vec<f64>) {
 /// |b(m)|^2 for each grid index m = 0..K-1 along one dimension: the inverse
 /// squared modulus of the DFT of the (order-1)-fold zero-padded spline
 /// values at integer knots. See Essmann et al. eq. (4.4).
-fn bspline_moduli(order: usize, k: usize) -> Vec<f64> {
+pub(crate) fn bspline_moduli(order: usize, k: usize) -> Vec<f64> {
     let (arr, _) = fill_bspline(0.0, order);
     // `arr[i]` (unreversed) equals M_n(order-1-i); the modulus formula
     // needs padded[k] = M_n(k+1) for k = 0..order-2, i.e. the same values
@@ -255,7 +255,7 @@ fn grid_index(base: isize, i: usize, dim: usize) -> usize {
     raw.rem_euclid(dim as isize) as usize
 }
 
-fn fft3d(data: &mut [Complex64], dims: [usize; 3], direction: FftDirection) {
+pub(crate) fn fft3d(data: &mut [Complex64], dims: [usize; 3], direction: FftDirection) {
     let [nx, ny, nz] = dims;
     let mut planner = FftPlanner::new();
 
@@ -322,7 +322,7 @@ pub fn compute_pme_forces(topology: &Topology, ctx: &PmeContext) -> PmeResult {
     let splines = atom_splines(topology, grid, order);
 
     // --- Charge spreading (serial: overlapping writes to shared grid). ---
-    let mut q_grid = vec![Complex64::new(0.0, 0.0); nx * ny * nz];
+    let mut q_grid: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); nx * ny * nz];
     for (atom, sp) in topology.atoms.iter().zip(splines.iter()) {
         let q = atom.charge;
         if q == 0.0 {
@@ -350,57 +350,12 @@ pub fn compute_pme_forces(topology: &Topology, ctx: &PmeContext) -> PmeResult {
         }
     }
 
-    // --- Forward FFT of the charge grid. ---
-    fft3d(&mut q_grid, grid, FftDirection::Forward);
-
-    // --- B-spline moduli (per-dimension, independent of atoms). ---
-    let bmod_x = bspline_moduli(order, nx);
-    let bmod_y = bspline_moduli(order, ny);
-    let bmod_z = bspline_moduli(order, nz);
-
-    let coeff = COULOMB_CONSTANT / (2.0 * std::f64::consts::PI * volume);
-    let pi2 = std::f64::consts::PI * std::f64::consts::PI;
-
-    let signed_freq = |i: usize, k: usize| -> f64 {
-        if i <= k / 2 {
-            i as f64
-        } else {
-            i as f64 - k as f64
-        }
-    };
-
-    let mut theta_q = vec![Complex64::new(0.0, 0.0); nx * ny * nz];
-    let mut energy = 0.0f64;
-    let mut virial = 0.0f64;
-
-    for ix in 0..nx {
-        let mx = signed_freq(ix, nx) / lengths[0];
-        for iy in 0..ny {
-            let my = signed_freq(iy, ny) / lengths[1];
-            let row = (ix * ny + iy) * nz;
-            for iz in 0..nz {
-                if ix == 0 && iy == 0 && iz == 0 {
-                    continue;
-                }
-                let mz = signed_freq(iz, nz) / lengths[2];
-                let m2 = mx * mx + my * my + mz * mz;
-                if m2 < 1e-14 {
-                    continue;
-                }
-                let bfac = bmod_x[ix] * bmod_y[iy] * bmod_z[iz];
-                let theta = (-pi2 * m2 / (alpha * alpha)).exp() / m2 * bfac;
-                let qhat = q_grid[row + iz];
-                let e_term = coeff * theta * qhat.norm_sqr();
-                energy += e_term;
-                virial += e_term * (1.0 - 2.0 * pi2 * m2 / (alpha * alpha));
-                theta_q[row + iz] = qhat * (coeff * theta);
-            }
-        }
-    }
-
-    // --- Inverse FFT to get dE/dQ on the grid (unnormalized, matching the
-    // unnormalized forward transform above; see module derivation notes). ---
-    fft3d(&mut theta_q, grid, FftDirection::Inverse);
+    // --- Forward FFT, influence function, inverse FFT: factored into
+    // `pme_recip_from_grid` so the GPU-resident backend's GPU-side charge
+    // spreading can drive the exact same numerical pipeline. ---
+    let charge_grid_re: Vec<f64> = q_grid.iter().map(|c| c.re).collect();
+    let (potential_grid, energy, virial) =
+        pme_recip_from_grid(&charge_grid_re, grid, order, alpha, lengths, volume);
 
     // --- Force gather: analytic derivative of E via the same splines. ---
     let forces: Vec<[f64; 3]> = topology
@@ -432,8 +387,9 @@ pub fn compute_pme_forces(topology: &Topology, ctx: &PmeContext) -> PmeResult {
                         let wz = sp.w[2][iz];
                         let dwz = sp.dw[2][iz];
                         // dE/dQ at this grid point is 2*Re(theta_q) after
-                        // the inverse transform above (see derivation).
-                        let g = 2.0 * theta_q[row + gz].re;
+                        // the inverse transform above (see derivation);
+                        // `pme_recip_from_grid` already applies that factor.
+                        let g = potential_grid[row + gz] as f64;
                         f[0] -= q * dwx * wy * wz * scale[0] * g;
                         f[1] -= q * wx * dwy * wz * scale[1] * g;
                         f[2] -= q * wx * wy * dwz * scale[2] * g;
@@ -449,6 +405,88 @@ pub fn compute_pme_forces(topology: &Topology, ctx: &PmeContext) -> PmeResult {
         energy,
         virial,
     }
+}
+
+/// The middle third of `compute_pme_forces` (forward FFT, B-spline-moduli-
+/// corrected influence function, inverse FFT), factored out so a caller who
+/// already has a charge grid spread some other way (in particular: the
+/// GPU-resident backend's `pme_spread` WGSL kernel, which spreads charges
+/// from GPU-resident positions with no host readback of positions
+/// themselves) can drive the same numerically-exact CPU FFT pipeline
+/// without needing atom positions/charges again. `charge_grid` is the
+/// spread charge density, real-valued, row-major `(nx, ny, nz)` — exactly
+/// what `compute_pme_forces`'s internal `q_grid` holds right before its
+/// `fft3d(&mut q_grid, ...)` call, just without the imaginary part (always
+/// zero for a real charge density).
+///
+/// Returns `(potential_grid, energy, virial)` where `potential_grid` is
+/// `2 * Re(theta_q)` after the inverse FFT (row-major `(nx, ny, nz)`,
+/// `f32`) — precisely the per-grid-point quantity `compute_pme_forces`'s
+/// force-gather loop calls `g`, so a force-gather kernel/function fed this
+/// grid reproduces `compute_pme_forces`'s forces exactly (same weights,
+/// same derivative convention) given the same B-spline weights/derivatives
+/// at each atom.
+pub fn pme_recip_from_grid(
+    charge_grid: &[f64],
+    grid: [usize; 3],
+    order: usize,
+    alpha: f64,
+    box_lengths: [f64; 3],
+    volume: f64,
+) -> (Vec<f32>, f64, f64) {
+    let [nx, ny, nz] = grid;
+    let mut q_grid: Vec<Complex64> = charge_grid.iter().map(|&re| Complex64::new(re, 0.0)).collect();
+
+    fft3d(&mut q_grid, grid, FftDirection::Forward);
+
+    let bmod_x = bspline_moduli(order, nx);
+    let bmod_y = bspline_moduli(order, ny);
+    let bmod_z = bspline_moduli(order, nz);
+
+    let coeff = COULOMB_CONSTANT / (2.0 * PI * volume);
+    let pi2 = PI * PI;
+
+    let signed_freq = |i: usize, k: usize| -> f64 {
+        if i <= k / 2 {
+            i as f64
+        } else {
+            i as f64 - k as f64
+        }
+    };
+
+    let mut theta_q = vec![Complex64::new(0.0, 0.0); nx * ny * nz];
+    let mut energy = 0.0f64;
+    let mut virial = 0.0f64;
+
+    for ix in 0..nx {
+        let mx = signed_freq(ix, nx) / box_lengths[0];
+        for iy in 0..ny {
+            let my = signed_freq(iy, ny) / box_lengths[1];
+            let row = (ix * ny + iy) * nz;
+            for iz in 0..nz {
+                if ix == 0 && iy == 0 && iz == 0 {
+                    continue;
+                }
+                let mz = signed_freq(iz, nz) / box_lengths[2];
+                let m2 = mx * mx + my * my + mz * mz;
+                if m2 < 1e-14 {
+                    continue;
+                }
+                let bfac = bmod_x[ix] * bmod_y[iy] * bmod_z[iz];
+                let theta = (-pi2 * m2 / (alpha * alpha)).exp() / m2 * bfac;
+                let qhat = q_grid[row + iz];
+                let e_term = coeff * theta * qhat.norm_sqr();
+                energy += e_term;
+                virial += e_term * (1.0 - 2.0 * pi2 * m2 / (alpha * alpha));
+                theta_q[row + iz] = qhat * (coeff * theta);
+            }
+        }
+    }
+
+    fft3d(&mut theta_q, grid, FftDirection::Inverse);
+
+    let potential_grid: Vec<f32> = theta_q.iter().map(|c| (2.0 * c.re) as f32).collect();
+    (potential_grid, energy, virial)
 }
 
 /// Brute-force O(N*K^3) direct reciprocal Ewald sum plus the matching
