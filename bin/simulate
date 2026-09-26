@@ -23,6 +23,31 @@ def parse_args():
         default=None,
         help="Restart coordinates from .aqtrj last frame",
     )
+    parser.add_argument(
+        "--traj-format",
+        type=str,
+        default=None,
+        choices=["aqtrj", "dcd", "pdb", "xyz"],
+        help="Trajectory output format (default: aqtrj)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Write a binary checkpoint (positions, velocities, box, step, seed) at the end of the run",
+    )
+    parser.add_argument(
+        "--checkpoint-in",
+        type=str,
+        default=None,
+        help="Resume from a binary checkpoint written by --checkpoint",
+    )
+    parser.add_argument(
+        "--energy-log",
+        type=str,
+        default=None,
+        help="Write a CSV energy log (step,time_ps,potential,kinetic,total,temperature)",
+    )
     return parser.parse_args()
 
 
@@ -37,6 +62,10 @@ if __name__ == "__main__":
         args.temperature,
         args.restart,
         args.npt,
+        traj_format=args.traj_format,
+        checkpoint_out=args.checkpoint,
+        checkpoint_in=args.checkpoint_in,
+        energy_log=args.energy_log,
     )
     out = args.output or str(path.with_suffix(".md.aqtop"))
     top.write(out)
