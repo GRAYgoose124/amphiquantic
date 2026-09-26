@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Trajectory analysis CLI: rmsd / rmsf / rg / rdf / msd / hbonds / energy.
+
+Operates on amphiquantic's native .aqtrj trajectories (optionally paired
+with a .aqtop topology for atom selection) and writes CSV results, with
+optional matplotlib plots.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from amphiquantic.analysis import (
+    Trajectory,
+    load_aqtrj,
+    select,
+    rmsd_series,
+    rmsf,
+    radius_of_gyration_series,
+    radial_distribution_function,
+    unwrap_pbc,
+    mean_squared_displacement,
+    diffusion_coefficient,
+    hydrogen_bonds,
+    hbond_occupancy,
+    block_average_error,
+    statistical_inefficiency,
+    equilibration_time,
+)
+
+
+def _write_csv(path: str, header: list[str], rows) -> None:
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _maybe_plot(x, y, xlabel: str, ylabel: str, title: str, out_path: str | None) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.plot(x, y)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    if out_path:
+        fig.savefig(out_path)
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def _load_traj(args) -> Trajectory:
+    return load_aqtrj(args.trajectory, topology=args.topology)
+
+
+def _selected_indices(traj: Trajectory, args) -> np.ndarray | None:
+    if traj.topology is None:
+        return None
+    if not any([args.name, args.resname, args.resid, args.element, args.index]):
+        return None
+    sel = select(
+        traj,
+        name=args.name.split(",") if args.name else None,
+        resname=args.resname.split(",") if args.resname else None,
+        resid=[int(x) for x in args.resid.split(",")] if args.resid else None,
+        element=args.element.split(",") if args.element else None,
+        index=args.index,
+    )
+    return sel.indices
+
+
+def _add_selection_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--name", help="Comma-separated atom name(s)")
+    p.add_argument("--resname", help="Comma-separated residue name(s)")
+    p.add_argument("--resid", help="Comma-separated residue id(s)")
+    p.add_argument("--element", help="Comma-separated element symbol(s)")
+    p.add_argument("--index", help="Index ranges, e.g. '0,2,5-8'")
+
+
+def _add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("trajectory", help="Path to .aqtrj trajectory")
+    p.add_argument("--topology", default=None, help="Path to .aqtop topology (for selections)")
+    p.add_argument("-o", "--output", default=None, help="Output CSV path")
+    p.add_argument("--plot", default=None, help="Optional PNG path for a plot")
+
+
+def cmd_rmsd(args) -> None:
+    traj = _load_traj(args)
+    indices = _selected_indices(traj, args)
+    series = rmsd_series(traj.positions, indices=indices, fit=not args.no_fit)
+    time = traj.steps.astype(float) * args.dt
+    out = args.output or "rmsd.csv"
+    _write_csv(out, ["step", "time", "rmsd_nm"], zip(traj.steps, time, series))
+    print(f"Wrote {out} ({len(series)} frames)")
+    if args.plot:
+        _maybe_plot(time, series, "time", "RMSD (nm)", "RMSD", args.plot)
+
+
+def cmd_rmsf(args) -> None:
+    traj = _load_traj(args)
+    indices = _selected_indices(traj, args)
+    values = rmsf(traj.positions, indices=indices, fit=not args.no_fit)
+    atom_ids = indices if indices is not None else np.arange(traj.n_atoms)
+    out = args.output or "rmsf.csv"
+    _write_csv(out, ["atom_index", "rmsf_nm"], zip(atom_ids, values))
+    print(f"Wrote {out} ({len(values)} atoms)")
+    if args.plot:
+        _maybe_plot(atom_ids, values, "atom index", "RMSF (nm)", "RMSF", args.plot)
+
+
+def cmd_rg(args) -> None:
+    traj = _load_traj(args)
+    indices = _selected_indices(traj, args)
+    masses = traj.masses() if traj.topology is not None else None
+    series = radius_of_gyration_series(traj.positions, masses=masses, indices=indices)
+    time = traj.steps.astype(float) * args.dt
+    out = args.output or "rg.csv"
+    _write_csv(out, ["step", "time", "rg_nm"], zip(traj.steps, time, series))
+    print(f"Wrote {out} ({len(series)} frames)")
+    if args.plot:
+        _maybe_plot(time, series, "time", "Rg (nm)", "Radius of gyration", args.plot)
+
+
+def cmd_rdf(args) -> None:
+    traj = _load_traj(args)
+    indices = _selected_indices(traj, args)
+    r, g = radial_distribution_function(
+        traj.positions, traj.box, indices_a=indices, r_max=args.r_max, n_bins=args.bins
+    )
+    out = args.output or "rdf.csv"
+    _write_csv(out, ["r_nm", "g_r"], zip(r, g))
+    print(f"Wrote {out}")
+    if args.plot:
+        _maybe_plot(r, g, "r (nm)", "g(r)", "Radial distribution function", args.plot)
+
+
+def cmd_msd(args) -> None:
+    traj = _load_traj(args)
+    indices = _selected_indices(traj, args)
+    box = traj.box if args.unwrap else None
+    msd = mean_squared_displacement(traj.positions, indices=indices, box=box)
+    time = np.arange(len(msd)) * args.dt
+    out = args.output or "msd.csv"
+    _write_csv(out, ["lag_frames", "time", "msd_nm2"], zip(np.arange(len(msd)), time, msd))
+    d, slope, intercept = diffusion_coefficient(msd, args.dt)
+    print(f"Wrote {out}; D = {d:.6g} nm^2/time_unit (slope={slope:.6g}, intercept={intercept:.6g})")
+    if args.plot:
+        _maybe_plot(time, msd, "time", "MSD (nm^2)", "Mean squared displacement", args.plot)
+
+
+def cmd_hbonds(args) -> None:
+    traj = _load_traj(args)
+    if traj.topology is None:
+        print("hbonds requires --topology for donor/hydrogen/acceptor selection", file=sys.stderr)
+        sys.exit(1)
+    donors = select(traj, element=args.donor_element.split(",")).indices
+    hydrogens = select(traj, element=["H"]).indices
+    acceptors = select(traj, element=args.acceptor_element.split(",")).indices
+
+    # naive donor-hydrogen pairing: nearest H (by first-frame distance) per donor
+    pos0 = traj.positions[0]
+    donor_hydrogen_map = {}
+    for d in donors:
+        if len(hydrogens) == 0:
+            break
+        dists = np.linalg.norm(pos0[hydrogens] - pos0[d], axis=-1)
+        donor_hydrogen_map[int(d)] = int(hydrogens[np.argmin(dists)])
+
+    hbonds_per_frame = hydrogen_bonds(
+        traj.positions,
+        donors=donors,
+        hydrogens=hydrogens,
+        acceptors=acceptors,
+        donor_hydrogen_map=donor_hydrogen_map,
+        distance_cutoff=args.distance_cutoff,
+        angle_cutoff=args.angle_cutoff,
+        box=traj.box[0] if traj.box is not None else None,
+    )
+    occupancy = hbond_occupancy(hbonds_per_frame)
+    out = args.output or "hbonds.csv"
+    rows = sorted(occupancy.items(), key=lambda kv: -kv[1])
+    _write_csv(out, ["donor", "hydrogen", "acceptor", "occupancy"], [(d, h, a, occ) for (d, h, a), occ in rows])
+    counts_per_frame = [len(fb) for fb in hbonds_per_frame]
+    print(f"Wrote {out}; {len(occupancy)} distinct H-bonds, mean count/frame = {np.mean(counts_per_frame):.3f}")
+
+
+def cmd_energy(args) -> None:
+    traj = _load_traj(args)
+    series = {"epot": traj.epot, "ekin": traj.ekin, "etot": traj.epot + traj.ekin}
+    key = args.field
+    values = series[key]
+    g = statistical_inefficiency(values)
+    eq_t = equilibration_time(values)
+    sizes, errors = block_average_error(values[eq_t:])
+    out = args.output or "energy_stats.csv"
+    _write_csv(
+        out,
+        ["step", key],
+        zip(traj.steps, values),
+    )
+    print(
+        f"Wrote {out}; mean({key})={values.mean():.6g}, statistical_inefficiency={g:.3f}, "
+        f"equilibration_cutoff_step={traj.steps[eq_t] if eq_t < len(traj.steps) else traj.steps[-1]}"
+    )
+    if len(sizes) > 0:
+        print(f"block-averaging SEM at largest block size: {errors[-1]:.6g}")
+    if args.plot:
+        _maybe_plot(traj.steps, values, "step", key, f"Energy log: {key}", args.plot)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Analyze amphiquantic .aqtrj trajectories")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("rmsd", help="RMSD time series")
+    _add_common_args(p)
+    _add_selection_args(p)
+    p.add_argument("--dt", type=float, default=1.0, help="Time per frame (for the time column)")
+    p.add_argument("--no-fit", action="store_true", help="Skip Kabsch fitting before RMSD")
+    p.set_defaults(func=cmd_rmsd)
+
+    p = sub.add_parser("rmsf", help="Per-atom RMSF")
+    _add_common_args(p)
+    _add_selection_args(p)
+    p.add_argument("--no-fit", action="store_true", help="Skip Kabsch fitting before RMSF")
+    p.set_defaults(func=cmd_rmsf)
+
+    p = sub.add_parser("rg", help="Radius of gyration time series")
+    _add_common_args(p)
+    _add_selection_args(p)
+    p.add_argument("--dt", type=float, default=1.0)
+    p.set_defaults(func=cmd_rg)
+
+    p = sub.add_parser("rdf", help="Radial distribution function g(r)")
+    _add_common_args(p)
+    _add_selection_args(p)
+    p.add_argument("--r-max", type=float, default=None)
+    p.add_argument("--bins", type=int, default=100)
+    p.set_defaults(func=cmd_rdf)
+
+    p = sub.add_parser("msd", help="Mean squared displacement + diffusion coefficient")
+    _add_common_args(p)
+    _add_selection_args(p)
+    p.add_argument("--dt", type=float, default=1.0)
+    p.add_argument("--unwrap", action="store_true", help="Unwrap PBC before computing MSD")
+    p.set_defaults(func=cmd_msd)
+
+    p = sub.add_parser("hbonds", help="Hydrogen bond detection + occupancy")
+    _add_common_args(p)
+    p.add_argument("--donor-element", default="N,O", help="Comma-separated donor heavy-atom elements")
+    p.add_argument("--acceptor-element", default="N,O", help="Comma-separated acceptor elements")
+    p.add_argument("--distance-cutoff", type=float, default=0.35, help="H...A distance cutoff (nm)")
+    p.add_argument("--angle-cutoff", type=float, default=30.0, help="Max deviation from linear D-H...A (deg)")
+    p.set_defaults(func=cmd_hbonds)
+
+    p = sub.add_parser("energy", help="Energy log statistics")
+    _add_common_args(p)
+    p.add_argument("--field", choices=["epot", "ekin", "etot"], default="epot")
+    p.set_defaults(func=cmd_energy)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
